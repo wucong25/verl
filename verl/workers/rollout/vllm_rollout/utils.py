@@ -13,7 +13,24 @@
 # limitations under the License.
 
 import json
-from typing import Any
+import logging
+import os
+import platform
+import signal
+import threading
+from types import MethodType
+from typing import Any, Callable, TypedDict, get_args
+
+import torch
+import zmq
+
+from verl.utils.device import get_torch_device, is_npu_available
+from verl.utils.vllm import TensorLoRARequest, VLLMHijack
+from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
 VLLM_LORA_INT_ID = 123
@@ -23,18 +40,20 @@ VLLM_LORA_PATH = "simon_lora_path"
 
 def get_vllm_max_lora_rank(lora_rank: int):
     """
-    For vLLM, the smallest `max_lora_rank` is 8, and allowed values are (8, 16, 32, 64, 128, 256, 320, 512)
-    This function automatically adjusts the `max_lora_rank` to the nearest allowed value.
-
-    Reference: https://github.com/vllm-project/vllm/blob/8a297115e2367d463b781adb86b55ac740594cf6/vllm/config/lora.py#L27
+    For vLLM, automatically adjusts the `max_lora_rank` to the nearest allowed value.
+    The allowed values are retrieved from vLLM's MaxLoRARanks type definition.
     """
-    assert lora_rank > 0, f"lora_rank must be greater than 0 to invoke this function, get {lora_rank}"
-    vllm_max_lora_ranks = [8, 16, 32, 64, 128, 256, 320, 512]
+    assert lora_rank > 0, f"lora_rank must be greater than 0, get {lora_rank}"
+
+    from vllm.config.lora import MaxLoRARanks
+
+    vllm_max_lora_ranks = sorted(get_args(MaxLoRARanks))
+    if lora_rank > vllm_max_lora_ranks[-1]:
+        raise ValueError(f"lora_rank must be less than or equal to {vllm_max_lora_ranks[-1]}, but got {lora_rank}")
+
     for rank in vllm_max_lora_ranks:
         if lora_rank <= rank:
             return rank
-
-    raise ValueError(f"lora_rank must be less than or equal to {vllm_max_lora_ranks[-1]}, but got {lora_rank}")
 
 
 def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
