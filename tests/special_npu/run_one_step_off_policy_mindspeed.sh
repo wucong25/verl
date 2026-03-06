@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
-
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export HYDRA_FULL_ERROR=1
 # Test script for one_step_off_policy E2E regression testing
-# This script runs one_step_off_policy with FSDP2
+# This script runs one_step_off_policy with MindSpeed
 # to ensure the asynchronous training mechanism works correctly
 
-ACTOR_STRATEGY="fsdp2"
+ACTOR_STRATEGY="megatron"
 
 # Download model if not exists
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
 MODEL_PATH=${MODEL_PATH:-${HOME}/.cache/models/${MODEL_ID}}
 #hf download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
+
+DIST_CKPT_PATH=${DIST_CKPT_PATH:-${HOME}/dist_ckpt/qwen2_5_05b_grpo_mindspeed}
 
 # Algorithm parameters
 adv_estimator=grpo
@@ -35,7 +36,7 @@ overlong_penalty_factor=1.0
 # Training parameters
 loss_agg_mode="token-mean"
 train_prompt_bsz=8
-n_resp_per_prompt=2
+n_resp_per_prompt=3
 train_prompt_mini_bsz=4
 
 # Temperature parameters
@@ -46,8 +47,8 @@ val_top_p=0.7
 
 # One-step-off-policy specific parameters
 # Allocate 2 NPUs for rollout, 2 NPUs for training
-n_npus_rollout=2
-n_npus_training=2
+n_npus_rollout=4
+n_npus_training=4
 
 exp_name="$(basename "${MODEL_ID,,}")-one-step-off-policy-${ACTOR_STRATEGY}-minimal"
 
@@ -55,8 +56,8 @@ echo "Running one_step_off_policy with ${ACTOR_STRATEGY} strategy"
 echo "Rollout GPUs: ${n_npus_rollout}, Training GPUs: ${n_npus_training}"
 
 common_params=(
-    data.train_files="${HOME}/data/gsm8k/train.parquet"
-    data.val_files="${HOME}/data/gsm8k/test.parquet"
+    data.train_files="/home/dataset/gsm8k/train.parquet"
+    data.val_files="/home/dataset/gsm8k/test.parquet"
     data.prompt_key=prompt
     data.truncation='left'
     data.max_prompt_length=${max_prompt_length}
@@ -66,7 +67,7 @@ common_params=(
     algorithm.adv_estimator=${adv_estimator}
     algorithm.use_kl_in_reward=${use_kl_in_reward}
     algorithm.kl_ctrl.kl_coef=${kl_coef}
-    actor_rollout_ref.hybrid_engine=False \
+    actor_rollout_ref.hybrid_engine=False
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss}
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
@@ -79,7 +80,7 @@ common_params=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz}
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode}
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.60
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.70
     actor_rollout_ref.rollout.temperature=${temperature}
     actor_rollout_ref.rollout.top_p=${top_p}
     actor_rollout_ref.rollout.top_k=${top_k}
@@ -115,29 +116,37 @@ common_params=(
 
 )
 
-# FSDP2 specific parameters
+# Megatron specific parameters
 gen_tp=2
-sp_size=2
-fsdp_size=2
-ref_offload=True
-actor_offload=False
+pp_size=2
+tp_size=2
+ep_size=1
+offload=true
 
-python3 -m verl.experimental.one_step_off_policy.main_ppo \
+python3 -m verl.experimental.one_step_off_policy.main_ppo --config-path=config \
+    --config-name='one_step_off_ppo_megatron_trainer.yaml' \
     "${common_params[@]}" \
-    actor_rollout_ref.actor.fsdp_config.strategy=$ACTOR_STRATEGY \
-    critic.strategy=fsdp2 \
-    actor_rollout_ref.actor.grad_clip=1.0 \
+    actor_rollout_ref.actor.strategy=megatron \
+    actor_rollout_ref.ref.strategy=megatron \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
-    actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
-    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} $@
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${pp_size} \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${tp_size} \
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size=${ep_size} \
+    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${pp_size} \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${tp_size} \
+    actor_rollout_ref.ref.megatron.expert_model_parallel_size=${ep_size} \
+    actor_rollout_ref.actor.megatron.param_offload=${offload} \
+    actor_rollout_ref.actor.megatron.grad_offload=${offload} \
+    actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
+    actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
+    actor_rollout_ref.actor.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
+    actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
+    actor_rollout_ref.ref.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} $@
 
 echo "One-step-off-policy E2E test completed successfully with ${ACTOR_STRATEGY} strategy"
+
