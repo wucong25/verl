@@ -6,6 +6,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Test script for one_step_off_policy E2E regression testing
 # This script runs one_step_off_policy with FSDP2
 # to ensure the asynchronous training mechanism works correctly
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ACTOR_STRATEGY="fsdp2"
 
