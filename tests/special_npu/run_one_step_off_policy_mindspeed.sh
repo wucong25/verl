@@ -27,7 +27,7 @@ clip_ratio_high=0.28
 
 # Response length parameters
 max_prompt_length=1024
-max_response_length=2048
+max_response_length=1024
 enable_overlong_buffer=True
 overlong_buffer_len=128
 overlong_penalty_factor=1.0
@@ -35,7 +35,7 @@ overlong_penalty_factor=1.0
 # Training parameters
 loss_agg_mode="token-mean"
 train_prompt_bsz=8
-n_resp_per_prompt=3
+n_resp_per_prompt=2
 train_prompt_mini_bsz=4
 
 # Temperature parameters
@@ -45,7 +45,7 @@ top_k=-1
 val_top_p=0.7
 
 # One-step-off-policy specific parameters
-# Allocate 2 NPUs for rollout, 2 NPUs for training
+# Allocate 4 NPUs for rollout, 4 NPUs for training
 n_npus_rollout=4
 n_npus_training=4
 
@@ -79,7 +79,7 @@ common_params=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz}
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode}
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.70
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.60
     actor_rollout_ref.rollout.temperature=${temperature}
     actor_rollout_ref.rollout.top_p=${top_p}
     actor_rollout_ref.rollout.top_k=${top_k}
