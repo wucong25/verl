@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export HYDRA_FULL_ERROR=1
 # Test script for one_step_off_policy E2E regression testing
 # This script runs one_step_off_policy with MindSpeed
