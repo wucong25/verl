@@ -83,12 +83,17 @@ def check_vllm_ascend_before_server_launch():
         VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE = bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", '0')))
         if VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE:
             raise AssertionError(
-                "AscendSocVersion.A2 is not support VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE in Single-card multi-process scenario now. "
+                "AscendSocVersion.A2 is not support VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE in \
+                Single-card multi-process scenario now. "
             )
 
 
 if is_torch_npu_available(check_device=False):
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
     from vllm_ascend.ops.linear_op import SequenceRowParallelOp
-    NPUModelRunner._select_moe_comm_method = vllm_ascend_select_moe_comm_method_wrapper(NPUModelRunner._select_moe_comm_method)
-    SequenceRowParallelOp.matmul_and_reduce = vllm_ascend_matmul_and_reduce_wrapper(SequenceRowParallelOp.matmul_and_reduce)
+    NPUModelRunner._select_moe_comm_method = vllm_ascend_select_moe_comm_method_wrapper(
+        NPUModelRunner._select_moe_comm_method
+    )
+    SequenceRowParallelOp.matmul_and_reduce = vllm_ascend_matmul_and_reduce_wrapper(
+        SequenceRowParallelOp.matmul_and_reduce
+    )
