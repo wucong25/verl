@@ -24,12 +24,12 @@ def vllm_ascend_select_moe_comm_method_wrapper(fn):
         moe_comm_method = fn(self, num_tokens, with_prefill)
         from vllm_ascend.ascend_forward_context import MoECommType
         from vllm_ascend.utils import get_ascend_soc_version, AscendSocVersion
+
         soc_version = get_ascend_soc_version()
 
         # AscendSocVersion.A2 is not support MC2 in Single-card multi-process scenario now.
         if soc_version in {AscendSocVersion.A2} and moe_comm_method == MoECommType.MC2:
-            quant_type = getattr(self.vllm_config.model_config.hf_config,
-                                'moe_quantize', None)
+            quant_type = getattr(self.vllm_config.model_config.hf_config, 'moe_quantize', None)
             # Currently, w4a8_dynamic does not support allgatherep
             if quant_type == "w4a8_dynamic":
                 moe_comm_method = MoECommType.ALLTOALL
@@ -51,15 +51,16 @@ def vllm_ascend_matmul_and_reduce_wrapper(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         from vllm_ascend.utils import get_ascend_soc_version, AscendSocVersion
+
         soc_version = get_ascend_soc_version()
-        #AscendSocVersion.A2 is not support MC2 in Single-card multi-process scenario now.
+        # AscendSocVersion.A2 is not support MC2 in Single-card multi-process scenario now.
         if soc_version in {AscendSocVersion.A2}:
             from vllm.forward_context import get_forward_context
             try:
                 forward_context = get_forward_context()
                 forward_context.mmrs_fusion = False
             except AssertionError:
-                # forward_context.mmrs_fusion will be false in matmul_and_reduce func. 
+                # forward_context.mmrs_fusion will be false in matmul_and_reduce func.
                 pass
         return fn(self, *args, **kwargs)
 
@@ -80,7 +81,7 @@ def check_vllm_ascend_before_server_launch():
         return _ascend_soc_version
     soc_version = get_ascend_soc_version_local()
     if soc_version in {AscendSocVersion.A2}:
-        VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE = bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", '0')))
+        VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE = bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0")))
         if VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE:
             raise AssertionError(
                 "AscendSocVersion.A2 is not support VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE in \
@@ -89,8 +90,9 @@ def check_vllm_ascend_before_server_launch():
 
 
 if is_torch_npu_available(check_device=False):
-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
     from vllm_ascend.ops.linear_op import SequenceRowParallelOp
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
     NPUModelRunner._select_moe_comm_method = vllm_ascend_select_moe_comm_method_wrapper(
         NPUModelRunner._select_moe_comm_method
     )
