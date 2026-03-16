@@ -139,6 +139,13 @@ common_params=(
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
 )
 
+    # Detect device
+    device_name=$(python3 - <<'EOF'
+from verl.utils.device import get_device_name
+print(get_device_name())
+EOF
+)
+
 if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
     echo "Running fully async training with FSDP2 strategy..."
     # FSDP2 specific parameters
@@ -148,7 +155,7 @@ if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
     ref_offload=True
     actor_offload=False
 
-    if [ "$device_name" ] && [ "$device_name" == "npu" ]; then
+    if [ -n "$device_name" ] && [ "$device_name" == "npu" ]; then
         common_params+=(
             # Todo The checkpoint_engine.backend should be unified to nccl
             # actor_rollout_ref.rollout.checkpoint_engine.backend='hccl'
@@ -183,7 +190,7 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
     ref_offload=True
     actor_offload=False
 
-    if [ "$device_name" ] && [ "$device_name" == "npu" ]; then
+    if [ -n "$device_name" ] && [ "$device_name" == "npu" ]; then
         train_tp=2
         common_params+=(
             # Todo The checkpoint_engine.backend should be unified to nccl
