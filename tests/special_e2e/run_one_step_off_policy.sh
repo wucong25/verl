@@ -131,7 +131,6 @@ if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
     actor_offload=False
 
     if [ "$device_name" ] && [ "$device_name" == "npu" ]; then
-        export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
         common_params+=(
             # Todo The checkpoint_engine.backend should be unified to nccl
             # actor_rollout_ref.rollout.checkpoint_engine.backend='hccl'
@@ -168,7 +167,6 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
     actor_offload=False
 
     if [ "$device_name" ] && [ "$device_name" == "npu" ]; then
-        export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
         common_params+=(
             # Todo The checkpoint_engine.backend should be unified to nccl
             # actor_rollout_ref.rollout.checkpoint_engine.backend='hccl'
