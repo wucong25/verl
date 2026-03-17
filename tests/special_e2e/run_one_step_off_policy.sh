@@ -170,9 +170,14 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
         common_params+=(
             # Todo The checkpoint_engine.backend should be unified to nccl
             # actor_rollout_ref.rollout.checkpoint_engine.backend='hccl'
-            actor_rollout_ref.rollout.gpu_memory_utilization=0.60
+            actor_rollout_ref.rollout.gpu_memory_utilization=0.70
             trainer.n_gpus_per_node=4
             rollout.n_gpus_per_node=4
+            actor_rollout_ref.model.use_remove_padding=True \
+            actor_rollout_ref.model.enable_gradient_checkpointing=True \
+            actor_rollout_ref.actor.use_dynamic_bsz=True \
+            actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+            actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
         )
         train_tp=2
         actor_offload=True
