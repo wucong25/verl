@@ -607,7 +607,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                             log_only_rank_0=True,
                         )
                     else:
-                        self.bridge.save_hf_weights(self.model, hf_ckpt_path)
+                        self.bridge.save_hf_weights(self.model, hf_ckpt_path, strict=False)
 
                 log_with_rank(f"Saved bridge checkpoint to {hf_ckpt_path}", rank=self.rank, logger=logger)
 
