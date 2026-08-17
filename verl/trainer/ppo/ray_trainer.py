@@ -1316,6 +1316,11 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        distillation_use_full_vocab = (
+            self.distillation_config.distillation_loss.loss_settings.use_full_vocab
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
         if is_distillation_enabled(self.config.get("distillation")):
             distillation_loss_cfg = self.distillation_config.distillation_loss
@@ -1334,6 +1339,7 @@ class RayPPOTrainer:
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
             distillation_only=distillation_only,
+            distillation_use_full_vocab=distillation_use_full_vocab,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
             epochs=ppo_epochs,

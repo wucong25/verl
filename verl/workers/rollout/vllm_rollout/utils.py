@@ -493,7 +493,7 @@ def build_mtp_speculative_config(
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
     """Extract prompt log probabilities from generation output."""
-    if num_prompt_logprobs is None:
+    if num_prompt_logprobs is None or output.prompt_logprobs is None:
         return
 
     prompt_logprobs_ls, prompt_ids_ls = [], []

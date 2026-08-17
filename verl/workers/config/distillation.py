@@ -20,7 +20,7 @@ from typing import Optional
 from verl.base_config import BaseConfig
 from verl.utils.config import omega_conf_to_dataclass
 
-from .rollout import RolloutConfig
+from .rollout import RolloutConfig, get_engine_pcp_size
 
 __all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
 
@@ -81,6 +81,23 @@ class DistillationLossConfig(BaseConfig):
     # overhead (saved-tensor total stays constant either way).
     chunked_topk_chunk_size: int = 4096
 
+    # Full-vocabulary KL (loss_mode='forward_kl_full_vocab' / 'reverse_kl_full_vocab'):
+    # the teacher exports pre-lm_head hidden states and the student rebuilds
+    # full-vocab teacher logits on the fly with the frozen teacher lm_head.
+    # Tokens per chunk along (B*T) when computing the full-vocab KL, bounding
+    # the [chunk, V] log-softmax buffer.
+    full_vocab_chunk_tokens: int = 4096
+    # Checkpoint to load the teacher lm_head from. None -> load from the
+    # teacher's model_path.
+    full_vocab_lm_head_checkpoint: Optional[str] = None
+    # Name of the lm_head weight in the checkpoint. "auto" reads embed_tokens
+    # when the teacher ties word embeddings, otherwise lm_head.
+    full_vocab_lm_head_layer: str = "auto"
+    # TransferQueue partition prefix isolating this run's hidden-state
+    # partitions from other runs sharing the same TQ cluster. None -> fall back
+    # to the VERL_FULL_VOCAB_EXPERIMENT_NAME env var, then "default_exp".
+    full_vocab_experiment_name: Optional[str] = None
+
     use_policy_gradient: bool = True
     policy_loss_mode: str = "vanilla"
     clip_ratio: float = 0.2
@@ -123,6 +140,12 @@ class DistillationLossConfig(BaseConfig):
                 " wrt model weights does not depend on teacher log probabilities."
             )
 
+        if self.loss_settings.use_full_vocab and self.full_vocab_chunk_tokens <= 0:
+            raise ValueError(
+                f"full_vocab_chunk_tokens must be > 0 when the distillation loss uses full-vocab "
+                f"KL, but got {self.full_vocab_chunk_tokens}."
+            )
+
 
 @dataclass
 class DistillationTeacherModelConfig(BaseConfig):
@@ -137,8 +160,8 @@ class DistillationTeacherModelConfig(BaseConfig):
     num_replicas (int):
         Number of inference replicas of this teacher to launch. Each replica occupies
         `per_replica_world_size` GPUs (= inference.data_parallel_size *
-        inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size),
-        so the teacher's total GPU footprint is
+        inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size *
+        inference.prefill_context_parallel_size), so the teacher's total GPU footprint is
         `num_replicas * per_replica_world_size`.
     """
 
@@ -155,6 +178,8 @@ class DistillationTeacherModelConfig(BaseConfig):
             self.inference.tensor_model_parallel_size
             * self.inference.data_parallel_size
             * self.inference.pipeline_model_parallel_size
+            # PCP (prefill context parallel) ranks are extra engine worker processes.
+            * self.inference.prefill_context_parallel_size
         )
 
     @property
@@ -169,7 +194,9 @@ class DistillationTeacherModelConfig(BaseConfig):
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
-    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+    def validate_and_prepare_for_distillation(
+        self, use_topk: bool, topk: Optional[int], use_full_vocab: bool = False
+    ) -> None:
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
@@ -183,7 +210,41 @@ class DistillationTeacherModelConfig(BaseConfig):
             )
         self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
         self.inference.response_length = 1
-        self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+        if use_full_vocab:
+            # Full-vocab mode uses prompt_logprobs=0 and exports hidden states instead of
+            # top-k logprobs, so the max_logprobs >= topk check does not apply.
+            self._validate_full_vocab_inference()
+        else:
+            self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+
+    def _validate_full_vocab_inference(self) -> None:
+        # Full-vocab KL exports per-request hidden states; exactly one request per engine
+        # forward keeps the exported hidden states aligned with the request.
+        if self.inference.max_num_seqs != 1:
+            raise ValueError(
+                "Full-vocab distillation requires the teacher inference engine to process one request "
+                f"at a time, but got max_num_seqs={self.inference.max_num_seqs}. Please set "
+                "distillation.teacher_models.<name>.inference.max_num_seqs=1."
+            )
+        if self.inference.enable_chunked_prefill:
+            raise ValueError(
+                "Full-vocab distillation requires chunked prefill to be disabled so that each teacher "
+                "forward contains exactly one complete request, but got enable_chunked_prefill=True. "
+                "Please set distillation.teacher_models.<name>.inference.enable_chunked_prefill=false."
+            )
+        if self.inference.max_num_batched_tokens < self.inference.max_model_len:
+            # On vLLM v1, enable_chunked_prefill=False does NOT stop the scheduler from
+            # splitting a prompt longer than max_num_batched_tokens into multiple prefill
+            # steps. The hidden-state capture keeps only the last forward, so a chunked
+            # prefill silently exports just the tail chunk of the sample.
+            raise ValueError(
+                "Full-vocab distillation requires the teacher prefill to run in a single "
+                f"forward, but max_num_batched_tokens={self.inference.max_num_batched_tokens} < "
+                f"max_model_len={self.inference.max_model_len}: longer samples would be chunked "
+                "and only the tail chunk's hidden states would be captured. Please set "
+                "distillation.teacher_models.<name>.inference.max_num_batched_tokens >= "
+                "max_model_len."
+            )
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
         if not use_topk:
@@ -271,11 +332,13 @@ class DistillationConfig(BaseConfig):
             return
 
         self.teacher_models = self._resolve_teacher_models()
+
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
+                use_full_vocab=self.distillation_loss.loss_settings.use_full_vocab,
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes
@@ -296,6 +359,9 @@ class DistillationConfig(BaseConfig):
                 inference.tensor_model_parallel_size
                 * inference.data_parallel_size
                 * inference.pipeline_model_parallel_size
+                # PCP (prefill context parallel) ranks are extra engine worker
+                # processes; keep in sync with per_replica_world_size.
+                * get_engine_pcp_size((inference.engine_kwargs or {}).get("vllm", {}) or {})
             )
             pool_size = self.n_gpus_per_node * self.nnodes
             if pool_size % per_replica != 0:

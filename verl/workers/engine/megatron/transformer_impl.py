@@ -1183,6 +1183,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         logits_processor_func: Callable,
         batch: TensorDict,
         data_format: str,
+        distillation_use_full_vocab: bool = False,
     ):
         assert logits.shape[:2] == label.shape[:2]
         # avoid non-positive temperature such as padding
@@ -1217,10 +1218,90 @@ class MegatronEngineWithLMHead(MegatronEngine):
         # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
         if distillation_use_topk:
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
+        if distillation_use_full_vocab:
+            ret.update(
+                self._full_vocab_distillation_outputs(
+                    student_logits=logits_bak,
+                    batch=batch,
+                    data_format=data_format,
+                    logits_processor_func=logits_processor_func,
+                )
+            )
         if not distillation_only:
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
         return ret
+
+    def _full_vocab_distillation_outputs(
+        self, *, student_logits, batch: TensorDict, data_format: str, logits_processor_func: Callable
+    ):
+        """Full-vocabulary forward-KL outputs via the shared losses.py dispatch.
+
+        ``logits_processor_func`` is expected to be
+        ``partial(distillation_ppo_loss, config=..., distillation_config=...)``; its
+        closure carries the same config objects the top-k branch uses.
+        """
+        from verl.trainer.distillation.losses import compute_full_vocab_loss
+
+        func_keywords = getattr(logits_processor_func, "keywords", None) or {}
+        actor_config = func_keywords.get("config")
+        distillation_config = func_keywords.get("distillation_config")
+        if actor_config is None or distillation_config is None:
+            raise ValueError(
+                "distillation_use_full_vocab=True requires the loss function to be "
+                "functools.partial(distillation_ppo_loss, config=..., distillation_config=...) "
+                f"so the engine can reach the distillation config, but got {logits_processor_func!r}."
+            )
+        teacher_lm_head_shards = self._get_teacher_lm_head_shards(
+            distillation_config=distillation_config, device=student_logits.device
+        )
+        return compute_full_vocab_loss(
+            config=actor_config,
+            distillation_config=distillation_config,
+            data=batch,
+            student_logits=student_logits,
+            data_format=data_format,
+            teacher_lm_head_shards=teacher_lm_head_shards,
+        )
+
+    def _get_teacher_lm_head_shards(self, *, distillation_config, device):
+        """This TP rank's teacher lm_head shards, one per teacher, cached on the engine."""
+        shards = getattr(self, "_teacher_lm_head_shards", None)
+        if shards is not None:
+            return shards
+
+        from verl.trainer.distillation.megatron.full_vocab_kl import load_teacher_lm_head_shard
+
+        loss_config = distillation_config.distillation_loss
+        hf_config = self.model_config.hf_config
+        # Multimodal composite configs (e.g. KimiK25Config, Qwen3VLConfig) nest the
+        # language-model fields under `text_config` instead of the top level.
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if isinstance(text_config, dict):
+            vocab_size = text_config.get("vocab_size")
+        else:
+            vocab_size = getattr(text_config, "vocab_size", None)
+        if vocab_size is None:
+            raise ValueError(
+                f"Could not resolve vocab_size from hf_config of type {type(hf_config).__name__} "
+                "(looked at the top level and under `text_config`). It is required to shard the "
+                "teacher lm_head for full-vocab distillation."
+            )
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        shards = {}
+        for teacher_key, teacher_config in distillation_config.teacher_models.items():
+            checkpoint_path = loss_config.full_vocab_lm_head_checkpoint or teacher_config.model_path
+            shards[teacher_key] = load_teacher_lm_head_shard(
+                checkpoint_path=checkpoint_path,
+                layer=loss_config.full_vocab_lm_head_layer,
+                vocab_size=vocab_size,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                device=device,
+            )
+        self._teacher_lm_head_shards = shards
+        return shards
 
     def forward_step(
         self, batch_iter: Iterator[TensorDict], model, logits_processor_func, postprocess_micro_batch_func
@@ -1239,6 +1320,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+        distillation_use_full_vocab = tu.get_non_tensor_data(batch, key="distillation_use_full_vocab", default=False)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
         pad_to_length_bucket = (
             self.engine_config.pad_to_length_bucket
@@ -1310,6 +1392,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if use_fused_kernels:
             temperature_value = _resolve_fused_temperature(temperature)
 
+        if distillation_use_full_vocab and use_fused_kernels:
+            raise ValueError(
+                "distillation_use_full_vocab=True is not supported with use_fused_kernels=True: "
+                "fused kernels bypass the logits processor where the full-vocabulary KL loss is "
+                "computed, so the distillation loss would be silently skipped. Set "
+                "actor_rollout_ref.actor.use_fused_kernels=False or use a non full-vocab "
+                "distillation loss."
+            )
+
         if use_fused_kernels:
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
@@ -1348,6 +1439,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 logits_processor_func=logits_processor_func,
                 batch=batch,
                 data_format=data_format,
+                distillation_use_full_vocab=distillation_use_full_vocab,
             )
 
             response_attention_mask = None

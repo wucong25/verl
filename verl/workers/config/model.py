@@ -17,6 +17,21 @@ from typing import Any, Optional
 from omegaconf import MISSING
 from transformers import AutoConfig
 
+# Models loaded with ``trust_remote_code=True`` produce config/tokenizer classes under the
+# dynamic ``transformers_modules`` package. That package only appears in ``sys.modules``
+# after transformers' dynamic-module loader initializes it, so a fresh Ray worker process
+# (e.g. CheckpointEngineWorker) fails to unpickle an ``HFModelConfig`` carrying such
+# dynamic-class instances with ``ModuleNotFoundError: No module named 'transformers_modules'``.
+# Instances of HFModelConfig are pickled by Ray with the class reference first, so importing
+# this module is guaranteed to happen before the pickled ``hf_config`` attribute is
+# deserialized — registering the dynamic-module namespace here fixes the unpickle ordering.
+try:
+    from transformers.dynamic_module_utils import init_hf_modules
+
+    init_hf_modules()
+except Exception:  # pragma: no cover - transformers without dynamic_module_utils
+    pass
+
 from verl.base_config import BaseConfig
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local

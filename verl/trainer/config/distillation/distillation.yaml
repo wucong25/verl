@@ -39,6 +39,23 @@ distillation_loss:
   # Optional min clamp value for log probabilities for stability, e.g., log q - log p where p or q are very close to zero.
   log_prob_min_clamp: null
 
+  # ---- Full-vocabulary KL distillation (loss_mode: forward_kl_full_vocab / reverse_kl_full_vocab) ----
+
+  # Tokens per chunk along (B*T) when computing the full-vocab KL loss, bounding
+  # the [chunk, V] log-softmax buffer.
+  full_vocab_chunk_tokens: 4096
+
+  # Checkpoint to load the teacher lm_head from. If null, the teacher model_path is used.
+  full_vocab_lm_head_checkpoint: null
+
+  # Name of the lm_head weight in the checkpoint. "auto" reads embed_tokens when
+  # the teacher ties word embeddings, otherwise lm_head.
+  full_vocab_lm_head_layer: auto
+
+  # TransferQueue partition prefix isolating this run's hidden-state partitions.
+  # If null, falls back to the VERL_FULL_VOCAB_EXPERIMENT_NAME env var, then "default_exp".
+  full_vocab_experiment_name: null
+
   # Whether to incorporate distillation loss as a reward.
   use_policy_gradient: false
 
