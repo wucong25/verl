@@ -15,7 +15,7 @@
 """Student-side full-vocabulary KL distillation loss (Megatron engine).
 
 The teacher exports pre-lm_head hidden states to TransferQueue (see
-``verl.workers.rollout.vllm_rollout.full_vocab_hidden_export``); the training
+``verl.trainer.distillation.full_vocab_export``); the training
 batch only carries per-sample artifact metadata dicts
 (``data["teacher_full_vocab_artifact"]``). This module fetches the hidden
 states from TransferQueue, rebuilds full-vocab teacher logits on the fly with
@@ -37,29 +37,13 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
+from verl.trainer.distillation.full_vocab_export import _ensure_tq_initialized
 from verl.trainer.distillation.megatron.losses import vocab_parallel_log_softmax
 from verl.utils.fs import copy_to_local
 from verl.workers.config import DistillationConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-_TQ_INITIALIZED = False
-
-
-def _ensure_tq_initialized() -> None:
-    global _TQ_INITIALIZED
-    if _TQ_INITIALIZED:
-        return
-    try:
-        import transfer_queue as tq
-    except ImportError as exc:
-        raise RuntimeError(
-            "full-vocab distillation requires the transfer_queue package "
-            "(pip install TransferQueue) on the Megatron actor workers."
-        ) from exc
-    tq.init()
-    _TQ_INITIALIZED = True
 
 
 def load_teacher_lm_head_shard(
@@ -243,7 +227,8 @@ def _artifacts_of(data: TensorDict) -> list[dict[str, Any]]:
     if artifacts is None:
         raise KeyError(
             "full-vocab distillation: the micro batch has no 'teacher_full_vocab_artifact' field; "
-            "the agent loop must attach the teacher hidden-state artifact to every sample."
+            "the trainer must run the teacher engine forward "
+            "(TeacherEngineManager.compute_teacher_hidden, v1 trainer only) before update_actor."
         )
     if hasattr(artifacts, "tolist"):
         artifacts = artifacts.tolist()

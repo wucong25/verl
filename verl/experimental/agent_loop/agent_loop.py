@@ -152,13 +152,6 @@ class AgentLoopOutput(BaseModel):
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
-
-        # Full-vocab KL: pop the artifact metadata to the top level (like teacher_ids/
-        # teacher_logprobs) so it becomes its own TQ column / batch field — the Megatron
-        # loss reads it as a top-level NonTensorStack field of the micro batch.
-        teacher_full_vocab_artifact = output["extra_fields"].pop("teacher_full_vocab_artifact", None)
-        if teacher_full_vocab_artifact is not None:
-            output["teacher_full_vocab_artifact"] = teacher_full_vocab_artifact
         return output
 
 
@@ -487,7 +480,16 @@ class AgentLoopWorker:
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
+        # Full-vocab KL distillation computes teacher hidden states with forward-only
+        # training engines inside the trainer loop; there are no teacher servers to call.
+        self._engine_teacher_full_vocab = False
         if self.distillation_enabled:
+            from verl.trainer.distillation.losses import get_distillation_loss_settings
+
+            self._engine_teacher_full_vocab = get_distillation_loss_settings(
+                config.distillation.distillation_loss.loss_mode
+            ).use_full_vocab
+        if self.distillation_enabled and not self._engine_teacher_full_vocab:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
             self.teacher_key: str = config.distillation.teacher_key
@@ -617,25 +619,12 @@ class AgentLoopWorker:
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
-            # global_steps keys the full-vocab TQ export partitions; pass it explicitly
-            # (not via **kwargs) so it never leaks into concrete agent loops, which may
-            # reject unknown kwargs. Prefer a per-sample column (agent_loop_tq path),
-            # fall back to batch.meta_info (classic trainer path).
-            global_steps = kwargs.pop("global_steps", None)
-            if global_steps is None:
-                global_steps = batch.meta_info.get("global_steps")
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(
-                        sample_sampling_params,
-                        trajectory_info[i],
-                        trace=trace_this_sample,
-                        global_steps=global_steps,
-                        **kwargs,
-                    )
+                    self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
         outputs = await asyncio.gather(*tasks)
@@ -652,7 +641,6 @@ class AgentLoopWorker:
         *,
         agent_name: str,
         trace: bool = True,
-        global_steps: Optional[int] = None,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -680,9 +668,7 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(
-                output, trajectory["validate"], global_steps=global_steps, **kwargs
-            )
+            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
         self,
@@ -715,9 +701,7 @@ class AgentLoopWorker:
                 padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
         return padded
 
-    async def _agent_loop_postprocess(
-        self, output, validate, global_steps: Optional[int] = None, **kwargs
-    ) -> _InternalAgentLoopOutput:
+    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -818,7 +802,6 @@ class AgentLoopWorker:
             response_ids=output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
-            global_steps=global_steps,
         )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
@@ -1028,38 +1011,15 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
-        global_steps: Optional[int] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
-        if self.distillation_enabled and not validate:
+        if self.distillation_enabled and not self._engine_teacher_full_vocab and not validate:
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            if self.teacher_server_manager.distillation_loss_config.loss_settings.use_full_vocab:
-                # Full-vocab KL: the teacher exports pre-lm_head hidden states to
-                # TransferQueue; only the artifact metadata dict rides with the batch.
-                step, uid = self._resolve_full_vocab_step_uid(sample_kwargs)
-                if step is None and global_steps is not None:
-                    # The classic trainer path carries global_steps in batch.meta_info
-                    # (threaded here as an explicit argument), not in per-sample kwargs.
-                    # Use it so exports group into per-step partitions; guard against
-                    # the -1 "unset" sentinel.
-                    global_steps = int(global_steps.item() if hasattr(global_steps, "item") else global_steps)
-                    if global_steps >= 0:
-                        step = global_steps
-                artifact = await self.teacher_server_manager.compute_teacher_full_vocab_single(
-                    sequence_ids=prompt_ids + response_ids,
-                    step=step,
-                    uid=uid,
-                    routing_key=routing_key,
-                    multi_modal_data=output.multi_modal_data,
-                    mm_processor_kwargs=output.mm_processor_kwargs,
-                )
-                output.extra_fields["teacher_full_vocab_artifact"] = artifact
-                return
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
@@ -1068,36 +1028,6 @@ class AgentLoopWorker:
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
-
-    @staticmethod
-    def _resolve_full_vocab_step_uid(
-        sample_kwargs: Optional[dict[str, Any]],
-    ) -> tuple[Optional[int], Optional[str]]:
-        """Resolve (step, uid) for the full-vocab TQ key from per-sample kwargs.
-
-        The TransferQueue agent-loop path (agent_loop_tq) provides ``global_steps``,
-        ``uid`` and ``session_id``; ``session_id`` (the rollout-n index) is folded
-        into the uid so the n rollouts of one prompt do not collide on the same
-        TQ key. The v0 path only carries dataset columns (``uid``) and has no
-        ``global_steps`` — None is returned then and the teacher manager falls back
-        to a monotonic counter (see compute_teacher_full_vocab_single).
-        """
-        if sample_kwargs is None:
-            return None, None
-
-        def _normalize(value):
-            return value.item() if hasattr(value, "item") else value
-
-        step = sample_kwargs.get("global_steps")
-        step = int(_normalize(step)) if step is not None else None
-        uid = sample_kwargs.get("uid")
-        if uid is None:
-            return step, None
-        uid = str(_normalize(uid))
-        session_id = sample_kwargs.get("session_id")
-        if session_id is not None:
-            uid = f"{uid}_{_normalize(session_id)}"
-        return step, uid
 
     def _postprocess(
         self,

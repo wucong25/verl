@@ -20,6 +20,7 @@ from typing import Optional
 from verl.base_config import BaseConfig
 from verl.utils.config import omega_conf_to_dataclass
 
+from .engine import EngineConfig
 from .rollout import RolloutConfig, get_engine_pcp_size
 
 __all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
@@ -157,12 +158,23 @@ class DistillationTeacherModelConfig(BaseConfig):
         Model path for the teacher model. Can be a local path or a Hugging Face model
     inference (RolloutConfig):
         Rollout configuration for the teacher model inference during distillation.
+        Used by the top-k distillation teacher (vLLM/SGLang server).
+    engine (EngineConfig, optional):
+        Training-engine configuration for the teacher forward. Required for — and only
+        supported by — full-vocabulary KL distillation
+        (loss_mode='forward_kl_full_vocab' / 'reverse_kl_full_vocab'), where the
+        teacher's pre-lm_head hidden states are computed by a forward-only
+        Megatron/FSDP engine instead of an inference server. ``forward_only`` is
+        forced True. Provide a ``McoreEngineConfig`` (strategy="megatron") or
+        ``FSDPEngineConfig`` (strategy="fsdp"/"fsdp2") via ``_target_``.
     num_replicas (int):
-        Number of inference replicas of this teacher to launch. Each replica occupies
-        `per_replica_world_size` GPUs (= inference.data_parallel_size *
+        Inference mode: number of inference replicas of this teacher to launch. Each
+        replica occupies `per_replica_world_size` GPUs (= inference.data_parallel_size *
         inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size *
         inference.prefill_context_parallel_size), so the teacher's total GPU footprint is
         `num_replicas * per_replica_world_size`.
+        Engine mode: `per_replica_world_size` is the model-parallel world size
+        (megatron: tp * pp * cp; fsdp: 1) and `num_replicas` is the data-parallel size.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {"num_replicas", "key"}
@@ -170,10 +182,21 @@ class DistillationTeacherModelConfig(BaseConfig):
     key: Optional[str] = None
     model_path: Optional[str] = None
     inference: RolloutConfig = field(default_factory=RolloutConfig)
+    engine: Optional[EngineConfig] = None
     num_replicas: Optional[int] = 0
 
     @property
     def per_replica_world_size(self) -> int:
+        if self.engine is not None:
+            if self.engine.strategy == "megatron":
+                return (
+                    self.engine.tensor_model_parallel_size
+                    * self.engine.pipeline_model_parallel_size
+                    * self.engine.context_parallel_size
+                )
+            # FSDP shards weights across the whole worker group; the model-parallel
+            # world size is 1 and num_replicas is the data-parallel size.
+            return 1
         return (
             self.inference.tensor_model_parallel_size
             * self.inference.data_parallel_size
@@ -197,6 +220,18 @@ class DistillationTeacherModelConfig(BaseConfig):
     def validate_and_prepare_for_distillation(
         self, use_topk: bool, topk: Optional[int], use_full_vocab: bool = False
     ) -> None:
+        if use_full_vocab:
+            # Full-vocab KL: the teacher's hidden states are computed by a forward-only
+            # training engine, so the inference (vLLM/SGLang) settings do not apply.
+            self._validate_and_prepare_engine_teacher()
+            return
+        if self.engine is not None:
+            raise ValueError(
+                "distillation.teacher_models.<name>.engine is only supported together with a "
+                "full-vocab distillation loss (loss_mode='forward_kl_full_vocab' / "
+                "'reverse_kl_full_vocab'); top-k distillation teachers run as inference "
+                "servers configured via `inference`."
+            )
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
@@ -210,40 +245,39 @@ class DistillationTeacherModelConfig(BaseConfig):
             )
         self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
         self.inference.response_length = 1
-        if use_full_vocab:
-            # Full-vocab mode uses prompt_logprobs=0 and exports hidden states instead of
-            # top-k logprobs, so the max_logprobs >= topk check does not apply.
-            self._validate_full_vocab_inference()
-        else:
-            self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+        self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
 
-    def _validate_full_vocab_inference(self) -> None:
-        # Full-vocab KL exports per-request hidden states; exactly one request per engine
-        # forward keeps the exported hidden states aligned with the request.
-        if self.inference.max_num_seqs != 1:
+    def _validate_and_prepare_engine_teacher(self) -> None:
+        """Validate the forward-only training engine used for full-vocab teacher forwards."""
+        if self.engine is None:
             raise ValueError(
-                "Full-vocab distillation requires the teacher inference engine to process one request "
-                f"at a time, but got max_num_seqs={self.inference.max_num_seqs}. Please set "
-                "distillation.teacher_models.<name>.inference.max_num_seqs=1."
+                "Full-vocab distillation computes teacher hidden states with a forward-only "
+                "training engine; set distillation.teacher_models.<name>.engine, e.g. "
+                "_target_: verl.workers.config.McoreEngineConfig (strategy='megatron') or "
+                "verl.workers.config.FSDPEngineConfig (strategy='fsdp')."
             )
-        if self.inference.enable_chunked_prefill:
+        if self.engine.strategy not in ("megatron", "fsdp", "fsdp2"):
             raise ValueError(
-                "Full-vocab distillation requires chunked prefill to be disabled so that each teacher "
-                "forward contains exactly one complete request, but got enable_chunked_prefill=True. "
-                "Please set distillation.teacher_models.<name>.inference.enable_chunked_prefill=false."
+                f"Full-vocab teacher engine strategy must be one of 'megatron'/'fsdp'/'fsdp2', "
+                f"but got {self.engine.strategy!r}."
             )
-        if self.inference.max_num_batched_tokens < self.inference.max_model_len:
-            # On vLLM v1, enable_chunked_prefill=False does NOT stop the scheduler from
-            # splitting a prompt longer than max_num_batched_tokens into multiple prefill
-            # steps. The hidden-state capture keeps only the last forward, so a chunked
-            # prefill silently exports just the tail chunk of the sample.
+        # The teacher is frozen and only runs forwards; no optimizer is ever built.
+        self.engine.forward_only = True
+        if self.engine.strategy == "megatron" and getattr(self.engine, "dynamic_context_parallel", False):
+            raise NotImplementedError(
+                "Full-vocab teacher engine does not support dynamic_context_parallel; set "
+                "distillation.teacher_models.<name>.engine.dynamic_context_parallel=false."
+            )
+        if self.engine.use_dynamic_bsz:
+            if self.engine.infer_max_token_len_per_gpu is None:
+                raise ValueError(
+                    "Full-vocab teacher engine has use_dynamic_bsz=True; set "
+                    "distillation.teacher_models.<name>.engine.infer_max_token_len_per_gpu."
+                )
+        elif self.engine.infer_micro_batch_size_per_gpu is None:
             raise ValueError(
-                "Full-vocab distillation requires the teacher prefill to run in a single "
-                f"forward, but max_num_batched_tokens={self.inference.max_num_batched_tokens} < "
-                f"max_model_len={self.inference.max_model_len}: longer samples would be chunked "
-                "and only the tail chunk's hidden states would be captured. Please set "
-                "distillation.teacher_models.<name>.inference.max_num_batched_tokens >= "
-                "max_model_len."
+                "Full-vocab teacher engine has use_dynamic_bsz=False; set "
+                "distillation.teacher_models.<name>.engine.infer_micro_batch_size_per_gpu."
             )
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
@@ -354,15 +388,29 @@ class DistillationConfig(BaseConfig):
         if len(self.teacher_models) == 1:
             # Single teacher occupies the entire teacher resource pool.
             teacher_model = self.teacher_models["teacher_model"]
-            inference = teacher_model.inference
-            per_replica = (
-                inference.tensor_model_parallel_size
-                * inference.data_parallel_size
-                * inference.pipeline_model_parallel_size
-                # PCP (prefill context parallel) ranks are extra engine worker
-                # processes; keep in sync with per_replica_world_size.
-                * get_engine_pcp_size((inference.engine_kwargs or {}).get("vllm", {}) or {})
-            )
+            if getattr(teacher_model, "engine", None) is not None:
+                # Engine mode (full-vocab): one "replica" spans the model-parallel
+                # world; num_replicas is the data-parallel size. Convert first so
+                # dataclass defaults (e.g. context_parallel_size=1) are populated.
+                engine = omega_conf_to_dataclass(teacher_model.engine)
+                if engine.strategy == "megatron":
+                    per_replica = (
+                        engine.tensor_model_parallel_size
+                        * engine.pipeline_model_parallel_size
+                        * engine.context_parallel_size
+                    )
+                else:
+                    per_replica = 1
+            else:
+                inference = teacher_model.inference
+                per_replica = (
+                    inference.tensor_model_parallel_size
+                    * inference.data_parallel_size
+                    * inference.pipeline_model_parallel_size
+                    # PCP (prefill context parallel) ranks are extra engine worker
+                    # processes; keep in sync with per_replica_world_size.
+                    * get_engine_pcp_size((inference.engine_kwargs or {}).get("vllm", {}) or {})
+                )
             pool_size = self.n_gpus_per_node * self.nnodes
             if pool_size % per_replica != 0:
                 raise ValueError(

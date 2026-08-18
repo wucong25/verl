@@ -15,8 +15,6 @@
 import asyncio
 import logging
 import os
-import re
-from typing import Optional
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -29,13 +27,6 @@ from verl.workers.rollout.replica import get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def _resolve_partition_prefix(experiment_name: Optional[str]) -> str:
-    """Sanitize the experiment name for use in full-vocab TQ partition names."""
-    if not experiment_name:
-        return ""
-    return re.sub(r"[^0-9A-Za-z_-]+", "_", experiment_name).strip("_")
 
 
 @auto_await
@@ -51,7 +42,6 @@ class TeacherModelManager:
         distillation_config: DistillationConfig,
         teacher_model_config: DistillationTeacherModelConfig,
         resource_pool: RayResourcePool,
-        full_vocab_export_config: dict | None = None,
     ):
         """
         Initialize the teacher model manager.
@@ -60,16 +50,12 @@ class TeacherModelManager:
             distillation_config (DistillationConfig): Distillation configuration.
             teacher_model_config (DistillationTeacherModelConfig): Teacher model configuration.
             resource_pool (RayResourcePool): Dedicated teacher resource pool.
-            full_vocab_export_config (dict | None): Full-vocab KL hidden-state export
-                config ``{"enabled": bool, "prefix": str}`` derived from the
-                distillation loss config by ``MultiTeacherModelManager``.
         """
 
         # Need dataclass conversion for max_logprobs handling in post_init
         self.distillation_config = distillation_config
         self.teacher_model_config = teacher_model_config
         self.resource_pool = resource_pool
-        self.full_vocab_export_config = full_vocab_export_config
         self._initialize_llm_servers()
         self._initialize_load_balancer_handle()
 
@@ -100,16 +86,6 @@ class TeacherModelManager:
             }
         )
         name_suffix = (teacher_model_config.key or "").replace("/", "_")
-        replica_extra_kwargs = {}
-        if self.full_vocab_export_config and self.full_vocab_export_config.get("enabled"):
-            # Full-vocab hidden export is only implemented for the vLLM teacher
-            # backend; other replica classes do not accept this kwarg.
-            if teacher_model_config.inference.name != "vllm":
-                raise ValueError(
-                    f"Full-vocab KL distillation requires the teacher inference backend to be 'vllm', "
-                    f"but teacher {teacher_model_config.key!r} uses {teacher_model_config.inference.name!r}."
-                )
-            replica_extra_kwargs["full_vocab_export_config"] = self.full_vocab_export_config
         self.rollout_replicas = [
             rollout_replica_class(
                 replica_rank=replica_rank,
@@ -118,7 +94,6 @@ class TeacherModelManager:
                 gpus_per_node=gpus_per_node,
                 is_teacher_model=True,
                 name_suffix=name_suffix,
-                **replica_extra_kwargs,
             )
             for replica_rank in range(num_replicas)
         ]
@@ -139,8 +114,7 @@ class TeacherModelManager:
 
         `per_replica_world_size` (W below) is the GPU count of a *single* inference
         replica — the product of the replica's inference-time parallelism
-        (tensor_model_parallel_size * data_parallel_size * pipeline_model_parallel_size
-        * prefill_context_parallel_size).
+        (tensor_model_parallel_size * data_parallel_size * pipeline_model_parallel_size).
         It is not the teacher's total GPU footprint (`num_replicas * W`).
 
         `split_resource_pool` walks bundles linearly and is oblivious to node
@@ -206,16 +180,6 @@ class MultiTeacherModelManager:
         self.config = config
         self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
 
-        # Full-vocab KL distillation: the teacher servers export pre-lm_head
-        # hidden states to TransferQueue. The prefix isolates this run's TQ
-        # partitions from other runs sharing the same TQ cluster.
-        distillation_loss = self.distillation_config.distillation_loss
-        use_full_vocab = distillation_loss.loss_settings.use_full_vocab
-        self.full_vocab_export_config = {
-            "enabled": bool(use_full_vocab),
-            "prefix": _resolve_partition_prefix(distillation_loss.full_vocab_experiment_name) if use_full_vocab else "",
-        }
-
         self.resource_pool = resource_pool
         self.teacher_model_managers: dict[str, TeacherModelManager] = {}
         self.server_addresses: dict[str, list[str]] = {}
@@ -234,15 +198,11 @@ class MultiTeacherModelManager:
                 distillation_config=self.distillation_config,
                 teacher_model_config=teacher_model_config,
                 resource_pool=teacher_pool,
-                full_vocab_export_config=self.full_vocab_export_config,
             )
-            self._register_teacher_model_manager(key, manager)
-
-    def _register_teacher_model_manager(self, key: str, manager: TeacherModelManager):
-        self.teacher_model_managers[key] = manager
-        self.server_addresses[key] = manager.server_addresses
-        self.server_handles[key] = manager.server_handles
-        self.load_balancer_handle[key] = manager.load_balancer_handle
+            self.teacher_model_managers[key] = manager
+            self.server_addresses[key] = manager.server_addresses
+            self.server_handles[key] = manager.server_handles
+            self.load_balancer_handle[key] = manager.load_balancer_handle
 
     def get_client(self) -> dict[str, LLMServerClient]:
         """Get the LLMServerClient for each teacher model."""

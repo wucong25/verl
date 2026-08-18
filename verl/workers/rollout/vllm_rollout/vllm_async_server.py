@@ -46,7 +46,6 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.config.rollout import get_engine_pcp_size
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
     get_max_position_embeddings,
@@ -54,7 +53,6 @@ from verl.workers.rollout.utils import (
     qwen2_5_vl_dedup_image_tokens,
     run_uvicorn,
 )
-from verl.workers.rollout.vllm_rollout.full_vocab_hidden_export import export_hidden_to_tq, unwrap_captured_hidden
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -96,7 +94,6 @@ class vLLMHttpServer:
         cuda_visible_devices: str,
         disaggregation_role: str = "null",
         disaggregation_kv_transfer_config: Optional[dict] = None,
-        full_vocab_export_config: Optional[dict] = None,
     ):
         """
         Args:
@@ -110,9 +107,6 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
             disaggregation_role: PD role, or ``"null"`` for normal rollout.
             disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
-            full_vocab_export_config: full-vocab KL distillation hidden-state export
-                config ``{"enabled": bool, "prefix": str}``; only set on teacher
-                servers (see ``verl.experimental.teacher_loop.teacher_model``).
         """
         if disaggregation_role not in ("null", "prefill", "decode"):
             raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
@@ -127,13 +121,6 @@ class vLLMHttpServer:
         self._pd_prefill_side_channel_port: Optional[int] = None
         self._pd_prefill_engine_id: Optional[str] = None
         self._pd_peer_idx: int = 0
-        # Full-vocab KL distillation: teacher-only hidden-state export config.
-        self._full_vocab_export_config = full_vocab_export_config
-        # The captured-hidden buffer lives on the model and is shared by all
-        # in-flight requests, so the whole capture -> generate -> fetch sequence
-        # must be serialized per server (the engine already runs one request at a
-        # time with max_num_seqs=1).
-        self._full_vocab_lock = asyncio.Lock()
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -229,7 +216,7 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        return await self.engine.collective_rpc(
+        await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
@@ -348,18 +335,13 @@ class vLLMHttpServer:
             )
 
         if self.config.data_parallel_size > 1:
-            # PCP ranks are extra worker processes sharing each DP engine instance's
-            # GPUs, so a local DP instance spans tp * pcp devices.
-            pcp_size = get_engine_pcp_size(engine_kwargs)
-            gpus_per_dp_instance = self.config.tensor_model_parallel_size * pcp_size
-            assert self.gpus_per_node % gpus_per_dp_instance == 0, (
-                "gpus_per_node should be divisible by tensor_model_parallel_size * pcp_size"
+            assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
+                "gpus_per_node should be divisible by tensor_model_parallel_size"
             )
-            data_parallel_size_local = self.gpus_per_node // gpus_per_dp_instance
-            assert len(self.workers) == data_parallel_size_local * gpus_per_dp_instance, (
+            data_parallel_size_local = self.gpus_per_node // self.config.tensor_model_parallel_size
+            assert len(self.workers) == data_parallel_size_local * self.config.tensor_model_parallel_size, (
                 f"num workers ({len(self.workers)}) should be equal to "
                 f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
-                f" * pcp_size ({pcp_size})"
             )
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
@@ -537,17 +519,11 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
-        full_vocab: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
-            full_vocab: full-vocab KL distillation metadata
-                ``{"teacher_name": str, "step": int, "uid": str}``. When given, the
-                pre-lm_head hidden states of this prefill-only forward are captured
-                and exported to TransferQueue, and the artifact metadata dict is
-                returned in ``TokenOutput.extra_fields["teacher_full_vocab_artifact"]``.
         """
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
@@ -561,14 +537,6 @@ class vLLMHttpServer:
                 priority=priority,
             )
 
-        if full_vocab is not None and not (
-            self._full_vocab_export_config and self._full_vocab_export_config.get("enabled")
-        ):
-            raise ValueError(
-                f"generate received full_vocab metadata (request_id={request_id}) but full-vocab "
-                "hidden-state export is not enabled on this server; only teacher servers started "
-                "with full_vocab_export_config can serve full-vocab distillation requests."
-            )
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -644,31 +612,14 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        full_vocab_artifact = None
-        if full_vocab is not None:
-            # The captured-hidden buffer is shared per model; serialize the whole
-            # capture -> forward -> fetch sequence against concurrent full-vocab
-            # requests on this server.
-            await self._full_vocab_lock.acquire()
-        try:
-            if full_vocab is not None:
-                # Install the hidden-state capture before the prefill-only forward.
-                try:
-                    await self.engine.collective_rpc(method="start_hidden_capture")
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"full-vocab export: start_hidden_capture failed (request_id={request_id}, "
-                        f"full_vocab={full_vocab})"
-                    ) from exc
-
-            with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
-                generator = self.engine.generate(
-                    prompt=prompt,
-                    sampling_params=sampling_params,
-                    request_id=request_id,
-                    lora_request=lora_request,
-                    priority=priority,
-                )
+        with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
 
             # Get final response
             final_res: Optional[RequestOutput] = None
@@ -676,13 +627,6 @@ class vLLMHttpServer:
                 final_res = output
             assert final_res is not None
 
-            if full_vocab is not None:
-                full_vocab_artifact = await self._export_full_vocab_hidden(
-                    request_id=request_id, full_vocab=full_vocab, seq_len=len(prompt_ids)
-                )
-        finally:
-            if full_vocab is not None:
-                self._full_vocab_lock.release()
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
@@ -696,18 +640,11 @@ class vLLMHttpServer:
                 extra_fields=extra_fields,
             )
 
-        if full_vocab_artifact is not None:
-            extra_fields["teacher_full_vocab_artifact"] = full_vocab_artifact
-        if full_vocab is None:
-            # Full-vocab teacher requests carry their supervision in the TQ
-            # artifact, not in prompt logprobs: the capture hook returns an
-            # empty prompt-logprobs dict (skipping the full-vocab logits
-            # materialization), so there is nothing to extract for them.
-            extract_prompt_logprobs(
-                output=final_res,
-                num_prompt_logprobs=sampling_params.prompt_logprobs,
-                result_dict=extra_fields,
-            )
+        extract_prompt_logprobs(
+            output=final_res,
+            num_prompt_logprobs=sampling_params.prompt_logprobs,
+            result_dict=extra_fields,
+        )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
@@ -829,43 +766,6 @@ class vLLMHttpServer:
             priority=priority,
             kv_transfer_params=decode_kv_params,
         )
-
-    async def _export_full_vocab_hidden(self, request_id: str, full_vocab: dict[str, Any], seq_len: int) -> dict:
-        """Fetch the captured hidden states from the workers and export them to TransferQueue.
-
-        ``seq_len`` is the number of prompt tokens the engine prefilled for this
-        request; it pins the expected capture length (see ``export_hidden_to_tq``).
-
-        Fail-loud: any missing capture or export failure raises with context — a
-        silent skip would silently disable distillation for the sample.
-        """
-        try:
-            rpc_result = await self.engine.collective_rpc(method="fetch_captured_hidden")
-        except Exception as exc:
-            raise RuntimeError(
-                f"full-vocab export: fetch_captured_hidden failed (request_id={request_id}, full_vocab={full_vocab})"
-            ) from exc
-        hidden = unwrap_captured_hidden(rpc_result)
-        if hidden is None:
-            raise RuntimeError(
-                f"full-vocab export: no worker returned a captured hidden state "
-                f"(request_id={request_id}, full_vocab={full_vocab}); the prefill forward did not "
-                "produce a capture — check that start_hidden_capture ran on this engine."
-            )
-        try:
-            return export_hidden_to_tq(
-                hidden=hidden,
-                seq_len=seq_len,
-                teacher_name=full_vocab["teacher_name"],
-                step=full_vocab["step"],
-                uid=full_vocab["uid"],
-                prefix=self._full_vocab_export_config["prefix"],
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"full-vocab export: TransferQueue export failed (request_id={request_id}, "
-                f"full_vocab={full_vocab}, hidden_shape={tuple(hidden.shape)})"
-            ) from exc
 
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
@@ -1158,10 +1058,6 @@ class vLLMHttpServer:
 
     def _get_worker_extension_cls(self) -> str:
         """Return the fully-qualified colocate worker extension class name."""
-        if self._full_vocab_export_config and self._full_vocab_export_config.get("enabled"):
-            # Teacher servers with full-vocab export enabled need the extra
-            # start/fetch hidden-capture RPCs on their workers.
-            return "verl.workers.rollout.vllm_rollout.full_vocab_hidden_export.FullVocabHiddenWorkerExtension"
         return "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
 
     def _get_cli_modules(self) -> list:
@@ -1213,17 +1109,9 @@ class vLLMReplica(RolloutReplica):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
-        full_vocab_export_config: Optional[dict] = None,
     ):
         super().__init__(
-            replica_rank,
-            config,
-            model_config,
-            gpus_per_node,
-            is_reward_model,
-            is_teacher_model,
-            name_suffix,
-            full_vocab_export_config=full_vocab_export_config,
+            replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
         self.server_class = ray.remote(vLLMHttpServer)
 
@@ -1286,7 +1174,6 @@ class vLLMReplica(RolloutReplica):
                 gpus_per_node=gpus_per_replica_node,
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
-                full_vocab_export_config=self.full_vocab_export_config,
             )
             self.servers.append(server)
 

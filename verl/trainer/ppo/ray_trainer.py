@@ -926,12 +926,19 @@ class RayPPOTrainer:
         if self.use_teacher_policy:
             from verl.experimental.teacher_loop import MultiTeacherModelManager
 
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+            if self.distillation_config.distillation_loss.loss_settings.use_full_vocab:
+                raise NotImplementedError(
+                    "Full-vocab distillation (forward_kl_full_vocab / reverse_kl_full_vocab) is only "
+                    "supported by the v1 trainer entrypoint (verl/trainer/main_ppo.py), which runs the "
+                    "teacher forward on a training engine inside the training loop. The v0 trainer "
+                    "(verl/trainer/main_ppo_v0.py) does not produce teacher hidden-state artifacts."
+                )
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
             self.distillation_config = None

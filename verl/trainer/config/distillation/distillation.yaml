@@ -101,6 +101,30 @@ teacher_models:
     key: null
     model_path: null
     num_replicas: 0
+    # Training-engine teacher forward. REQUIRED for full-vocab KL distillation
+    # (loss_mode=forward_kl_full_vocab / reverse_kl_full_vocab): the teacher's
+    # pre-lm_head hidden states are computed by a forward-only Megatron/FSDP
+    # engine during the training loop and exported to TransferQueue, instead of
+    # being captured from the inference server. Keep null for top-k distillation.
+    # per_replica_world_size in engine mode is the model-parallel world size
+    # (megatron: tp*pp*cp; fsdp: 1) and num_replicas is the data-parallel size.
+    # Example (megatron):
+    # engine:
+    #   _target_: verl.workers.config.McoreEngineConfig
+    #   strategy: megatron
+    #   tensor_model_parallel_size: 4
+    #   pipeline_model_parallel_size: 1
+    #   context_parallel_size: 1
+    #   sequence_parallel: true
+    #   param_offload: true
+    #   infer_max_token_len_per_gpu: 8192
+    # Example (fsdp):
+    # engine:
+    #   _target_: verl.workers.config.FSDPEngineConfig
+    #   strategy: fsdp
+    #   param_offload: true
+    #   infer_max_token_len_per_gpu: 8192
+    engine: null
     inference:
       _target_: verl.workers.config.RolloutConfig
       name: ${oc.select:actor_rollout_ref.rollout.name}

@@ -338,11 +338,21 @@ class PPOTrainer(ABC):
         # 8. initialize teacher loop manager
         if self.use_teacher_policy:
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            self.teacher_model_manager = MultiTeacherModelManager(
-                config=self.config,
-                resource_pool=teacher_resource_pool,
-            )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+            if self.distillation_config.distillation_loss.loss_settings.use_full_vocab:
+                # Full-vocab KL: teacher hidden states are computed by forward-only
+                # training engines during the training loop, not by inference servers.
+                from verl.experimental.teacher_loop.teacher_engine import TeacherEngineManager
+
+                self.teacher_model_manager = TeacherEngineManager(
+                    config=self.config,
+                    resource_pool=teacher_resource_pool,
+                )
+            else:
+                self.teacher_model_manager = MultiTeacherModelManager(
+                    config=self.config,
+                    resource_pool=teacher_resource_pool,
+                )
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
@@ -376,9 +386,13 @@ class PPOTrainer(ABC):
         """Get the On-Policy Distillation teacher server clients.
 
         Returns:
-            dict[str, LLMServerClient]: The teacher server clients.
+            dict[str, LLMServerClient]: The teacher server clients, or None when
+                distillation is disabled or a full-vocab loss is used (full-vocab
+                teachers run as forward-only training engines, not servers).
         """
-        return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
+        if not self.use_teacher_policy or self.distillation_config.distillation_loss.loss_settings.use_full_vocab:
+            return None
+        return self.teacher_model_manager.get_client()
 
     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
         """Get the handles of reward loop workers."""
@@ -572,6 +586,11 @@ class PPOTrainer(ABC):
         # 7. compute advantage and return
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
+
+        # 7.5 [OPTIONAL] full-vocab distillation: teacher engine forward + hidden-state export
+        if self.use_teacher_policy and self.distillation_config.distillation_loss.loss_settings.use_full_vocab:
+            with marked_timer("teacher_hidden", timing_raw, color="olive"):
+                batch = self._compute_teacher_hidden(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:
@@ -1562,6 +1581,16 @@ class PPOTrainer(ABC):
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
 
         return batch
+
+    def _compute_teacher_hidden(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Full-vocab distillation: run the teacher engine forward and export hidden states.
+
+        The teacher worker groups write each sample's pre-lm_head hidden states to
+        TransferQueue and append the ``teacher_full_vocab_artifact`` metadata column to
+        the batch's TQ records; the student loss fetches the hidden states via these
+        artifacts during ``_update_actor``.
+        """
+        return self.teacher_model_manager.compute_teacher_hidden(batch, global_steps=self.global_steps)
 
     def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the values of the batch."""

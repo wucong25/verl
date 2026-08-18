@@ -99,7 +99,6 @@ class RolloutReplica(ABC):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
-        full_vocab_export_config: Optional[dict] = None,
     ) -> None:
         self.replica_rank = replica_rank
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
@@ -109,8 +108,6 @@ class RolloutReplica(ABC):
             self.config.tensor_model_parallel_size
             * self.config.data_parallel_size
             * self.config.pipeline_model_parallel_size
-            # PCP (prefill context parallel) ranks are extra engine worker processes.
-            * self.config.prefill_context_parallel_size
         )
         self.gpus_per_node = gpus_per_node
         self.gpus_per_replica_node = min(gpus_per_node, self.world_size)
@@ -121,9 +118,6 @@ class RolloutReplica(ABC):
         self.is_reward_model = is_reward_model
         self.is_teacher_model = is_teacher_model
         self.name_suffix = f"_{name_suffix}" if name_suffix else ""
-        # Full-vocab KL distillation: teacher-only hidden-state export config
-        # ({"enabled": bool, "prefix": str}), forwarded to the rollout server.
-        self.full_vocab_export_config = full_vocab_export_config
 
         self.rollout_mode: RolloutMode = None
         self.workers: list[ActorHandle] = []
