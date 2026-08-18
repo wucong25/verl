@@ -15,11 +15,19 @@
 """FSDP teacher engine for full-vocabulary KL distillation.
 
 A forward-only variant of the LM-head engine that returns the pre-lm_head
-hidden states instead of logits: the HF backbone is called directly (falling
-back to ``output_hidden_states=True``), yielding the post-final-norm hidden
-states without materializing logits. Sequence-parallel shards are gathered and
-unpadded with the same utilities as per-token outputs, and the result is
-packed as nested ``[bsz, j1, hidden]`` exactly like ``log_probs``.
+hidden states instead of logits: the wrapped CausalLM is called with
+``output_hidden_states=True`` and the last entry (post final norm, pre
+lm_head) is kept. Calling the full ``self.module`` (rather than the inner
+backbone directly) is deliberate: only the root forward triggers the FSDP
+pre-forward hooks that gather the root-owned params (embedding / final norm).
+
+Memory note: ``output_hidden_states=True`` transiently materializes every
+layer's hidden states for one micro-batch; the tensor is released at the end
+of the forward step.
+
+Sequence-parallel shards are gathered and unpadded with the same utilities as
+per-token outputs, and the result is packed as nested ``[bsz, j1, hidden]``
+exactly like ``log_probs``.
 """
 
 import logging
@@ -58,21 +66,13 @@ class FSDPDistillTeacherEngine(FSDPEngineWithLMHead):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
-            # Prefer calling the backbone directly: output_hidden_states=True on the
-            # full CausalLM materializes every layer's hidden states, which is
-            # needlessly expensive. The backbone's last_hidden_state is the
-            # post-final-norm, pre-lm_head hidden states.
-            backbone = getattr(self.module, "model", None)
-            if backbone is not None:
-                backbone_output = backbone(**model_inputs, use_cache=False)
-                hidden = backbone_output.last_hidden_state
-            else:
-                raw_output = self.module(
-                    **model_inputs,
-                    use_cache=False,
-                    output_hidden_states=True,
-                )
-                hidden = raw_output.hidden_states[-1]
+            raw_output = self.module(
+                **model_inputs,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+            # Post-final-norm, pre-lm_head hidden states.
+            hidden = raw_output.hidden_states[-1]
 
         # With TP, hidden states may be DTensors sharded on the hidden dim.
         if isinstance(hidden, DTensor):

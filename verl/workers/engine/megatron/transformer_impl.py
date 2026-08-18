@@ -1330,6 +1330,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         if pad_to_length_bucket is not None and distillation_use_topk:
             raise RuntimeError("pad_to_length is not supported with top-K distillation")
+        if pad_to_length_bucket is not None and distillation_use_full_vocab:
+            raise RuntimeError(
+                "pad_to_length is not supported with full-vocab distillation: the teacher hidden "
+                "states are packed without the pad bucket, so student logits and teacher hidden "
+                "states would misalign."
+            )
         if pad_to_length_bucket is not None and self.enable_routing_replay:
             raise RuntimeError("pad_to_length is not supported with router replay")
 

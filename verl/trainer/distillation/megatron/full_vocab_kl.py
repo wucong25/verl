@@ -230,12 +230,16 @@ def _artifacts_of(data: TensorDict) -> list[dict[str, Any]]:
             "the trainer must run the teacher engine forward "
             "(TeacherEngineManager.compute_teacher_hidden, v1 trainer only) before update_actor."
         )
-    if hasattr(artifacts, "tolist"):
-        artifacts = artifacts.tolist()
-    artifacts = list(artifacts)
-    if any(a is None for a in artifacts):
+    # The column is a NonTensorStack of per-sample dicts (items may be NonTensorData).
+    result = []
+    for i in range(len(artifacts)):
+        item = artifacts[i]
+        if hasattr(item, "data") and not isinstance(item, dict):  # NonTensorData
+            item = item.data
+        result.append(item)
+    if any(a is None for a in result):
         raise ValueError("full-vocab distillation: some samples carry no teacher hidden-state artifact.")
-    return artifacts
+    return result
 
 
 def _compute_full_vocab_kl(

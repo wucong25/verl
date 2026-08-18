@@ -1719,7 +1719,7 @@ class PPOTrainer(ABC):
         if is_distillation_enabled(self.config.get("distillation")):
             distillation_loss_cfg = self.distillation_config.distillation_loss
             distillation_only = (
-                distillation_use_topk
+                (distillation_use_topk or distillation_use_full_vocab)
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )

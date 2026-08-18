@@ -34,7 +34,7 @@ import ray
 import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
-from tensordict.tensorclass import NonTensorStack
+from tensordict.tensorclass import NonTensorData, NonTensorStack
 from transfer_queue import KVBatchMeta
 
 from verl.single_controller.base.decorator import make_nd_compute_dataproto_dispatch_fn, register
@@ -126,7 +126,8 @@ class DistillTeacherWorker(TrainingWorker):
                 prefix=self.tq_prefix,
             )
             artifacts.append(artifact)
-        return TensorDict({"teacher_full_vocab_artifact": NonTensorStack(*artifacts)}, batch_size=len(data))
+        artifact_column = NonTensorStack.from_list([NonTensorData(a) for a in artifacts])
+        return TensorDict({"teacher_full_vocab_artifact": artifact_column}, batch_size=len(data))
 
 
 class TeacherEngineManager:
@@ -158,17 +159,26 @@ class TeacherEngineManager:
         for (key, teacher_config), teacher_pool in zip(teacher_models.items(), split_pools, strict=True):
             engine_config = omega_conf_to_dataclass(teacher_config.engine)
             engine_config.forward_only = True
+            if engine_config.strategy == "megatron":
+                from verl.workers.config import McoreOptimizerConfig
+
+                optimizer_config = McoreOptimizerConfig()
+            else:
+                optimizer_config = OptimizerConfig()
             worker_config = TrainingWorkerConfig(
                 model_type="distill_teacher",
                 # Deferred instantiation on the worker (see DistillTeacherWorker).
+                # use_remove_padding lives on the model config (TrainingWorker copies it
+                # onto the engine config), so propagate the engine setting here.
                 model_config=OmegaConf.create(
                     {
                         "_target_": "verl.workers.config.HFModelConfig",
                         "path": teacher_config.model_path,
+                        "use_remove_padding": engine_config.use_remove_padding,
                     }
                 ),
                 engine_config=engine_config,
-                optimizer_config=OptimizerConfig(),
+                optimizer_config=optimizer_config,
                 checkpoint_config=CheckpointConfig(),
                 extra_context={"teacher_key": key, "tq_prefix": self.tq_prefix},
             )
@@ -176,7 +186,7 @@ class TeacherEngineManager:
                 resource_pool=teacher_pool,
                 ray_cls_with_init=RayClassWithInitArgs(ray.remote(DistillTeacherWorker), config=worker_config),
                 device_name=self.config.trainer.device,
-                name_prefix=f"distill_teacher_{key}",
+                name_prefix=f"distill_teacher_{key.replace('/', '_')}",
             )
             worker_group.reset()  # initialize engines (forward_only: no optimizer, offload after load)
             self.teacher_wgs[key] = worker_group
