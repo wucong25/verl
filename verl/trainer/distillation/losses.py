@@ -172,16 +172,18 @@ def compute_full_vocab_loss(
     data: TensorDict,
     student_logits: torch.Tensor,
     data_format: str,
-    teacher_lm_head_shards: dict[str, torch.Tensor],
+    teacher_lm_head_shards: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the full-vocabulary forward KL loss in logit processor.
 
     The student rebuilds full-vocab teacher logits on the fly from the teacher's
     exported hidden states (carried by ``data`` as artifact metadata) and the
-    frozen teacher lm_head shards.
+    frozen teacher lm_head.
 
     Args:
-        teacher_lm_head_shards: teacher_key -> [V/tp, H] teacher lm_head shard for this TP rank.
+        teacher_lm_head_shards: teacher_key -> [V/tp, H] teacher lm_head shard for this
+            TP rank. Required on the Megatron path (loaded by the engine); unused on
+            the FSDP/VeOmni path (the full lm_head is loaded and cached per worker).
 
     Returns:
     - distillation_losses: (bsz, seqlen/cp_size)
@@ -189,6 +191,18 @@ def compute_full_vocab_loss(
     match config.strategy:
         case "megatron":
             from verl.trainer.distillation.megatron.full_vocab_kl import (
+                compute_forward_kl_full_vocab,
+                compute_reverse_kl_full_vocab,
+            )
+
+            if teacher_lm_head_shards is None:
+                raise ValueError("Megatron full-vocab distillation requires teacher_lm_head_shards.")
+            if distillation_config.distillation_loss.loss_mode == "reverse_kl_full_vocab":
+                distillation_loss_fn = compute_reverse_kl_full_vocab
+            else:
+                distillation_loss_fn = compute_forward_kl_full_vocab
+        case "fsdp" | "fsdp2" | "veomni":
+            from verl.trainer.distillation.fsdp.full_vocab_kl import (
                 compute_forward_kl_full_vocab,
                 compute_reverse_kl_full_vocab,
             )
@@ -255,6 +269,10 @@ def distillation_ppo_loss(
 
     # Called as logits processor
     if student_logits is not None:
+        if distillation_config.distillation_loss.loss_settings.use_full_vocab:
+            # Full-vocab KL on the FSDP/VeOmni path; the Megatron engine calls
+            # compute_full_vocab_loss directly from its logits processor.
+            return compute_full_vocab_loss(config, distillation_config, data, student_logits, data_format)
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
     # Called as final policy loss
@@ -375,7 +393,7 @@ def _finalize_forward_kl_losses(model_output: dict, data: TensorDict) -> tuple[t
             "Check that (1) the trainer entrypoint forwards `distillation_use_topk`/"
             "`distillation_use_full_vocab` to the actor worker (main_ppo_sync.py and "
             "ppo/ray_trainer.py `_update_actor` both do), (2) the training strategy supports "
-            "this loss (full-vocab KL requires the megatron engine), and (3) "
+            "this loss (full-vocab KL requires the megatron/fsdp/veomni engine), and (3) "
             "use_fused_kernels=False, since fused kernels bypass the logits processor."
         )
     distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)

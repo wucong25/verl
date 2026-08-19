@@ -12,48 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Student-side full-vocabulary KL distillation loss (Megatron engine).
+"""Student-side full-vocabulary KL distillation loss (FSDP/VeOmni engines).
 
-The teacher exports pre-lm_head hidden states to TransferQueue (see
-``verl.trainer.distillation.full_vocab_export``); the training
-batch only carries per-sample artifact metadata dicts
-(``data["teacher_full_vocab_artifact"]``). This module fetches the hidden
-states from TransferQueue, rebuilds full-vocab teacher logits on the fly with
-the frozen teacher lm_head shard of this TP rank, and computes the per-token
-forward/reverse KL against the student's vocab-parallel logits.
+Same data contract as the Megatron variant (see
+``verl.trainer.distillation.megatron.full_vocab_kl``): teacher hidden states
+are fetched from TransferQueue via per-sample artifacts and full-vocab teacher
+logits are rebuilt on the fly with the frozen teacher lm_head. The difference
+is that FSDP/VeOmni student logits are full-vocab (not TP-sharded), so the
+teacher lm_head is loaded whole and the softmax needs no cross-TP collectives;
+Ulysses SP only shards the sequence dimension, which is aligned by slicing the
+teacher rows exactly like the top-K path does.
 
 Memory: teacher logits are recomputed per chunk of ``full_vocab_chunk_tokens``
-tokens and again in backward from the saved hidden states, so the autograd
-graph never pins a full ``[tokens, vocab]`` teacher-logits tensor.
+tokens and again in backward from the saved hidden states. Note the chunk
+buffers are full-vocab wide here (no TP division), so long-vocab runs may want
+a smaller ``full_vocab_chunk_tokens`` than the Megatron path.
 """
 
 import logging
 import os
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
 from verl.trainer.distillation.full_vocab_common import (
     artifacts_of,
     fetch_teacher_hidden,
-    load_teacher_lm_head_shard,  # noqa: F401  (re-exported for the megatron engine)
+    get_full_teacher_lm_head,
 )
-from verl.trainer.distillation.megatron.losses import vocab_parallel_log_softmax
+from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_input_tensor
 from verl.workers.config import DistillationConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-class _VocabParallelFullVocabKL(torch.autograd.Function):
+class _FullVocabKL(torch.autograd.Function):
     """Per-token KL between teacher (rebuilt from hidden states) and student logits.
 
-    Both distributions are vocab-parallel: the softmax normalizers are computed
-    with all-reduces over the TP group, and the per-token KL partial sums are
-    all-reduced as well. Teacher logits are recomputed in backward from the
-    saved hidden states instead of being kept alive.
+    Non-vocab-parallel variant of the Megatron implementation: full-vocab
+    logits, plain softmax, no TP collectives. Teacher logits are recomputed in
+    backward from the saved hidden states instead of being kept alive.
 
     Columns where the teacher log-prob is not finite (padded vocab tail) are
     excluded from the loss and receive zero / student-only gradient.
@@ -62,14 +63,11 @@ class _VocabParallelFullVocabKL(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        student_logits: torch.Tensor,  # [tokens, V/tp], requires grad
+        student_logits: torch.Tensor,  # [tokens, V], requires grad
         teacher_hidden: torch.Tensor,  # [tokens, H]
-        teacher_lm_head: torch.Tensor,  # [V/tp, H]
+        teacher_lm_head: torch.Tensor,  # [V, H]
         reverse: bool,
     ):
-        from megatron.core.parallel_state import get_tensor_model_parallel_group
-
-        tp_group = get_tensor_model_parallel_group()
         teacher_logits = teacher_hidden @ teacher_lm_head.t()
         if teacher_logits.shape[-1] < student_logits.shape[-1]:
             teacher_logits = F.pad(
@@ -78,8 +76,8 @@ class _VocabParallelFullVocabKL(torch.autograd.Function):
         elif teacher_logits.shape[-1] > student_logits.shape[-1]:
             teacher_logits = teacher_logits[..., : student_logits.shape[-1]]
 
-        student_logps = vocab_parallel_log_softmax(student_logits)
-        teacher_logps = vocab_parallel_log_softmax(teacher_logits)
+        student_logps = F.log_softmax(student_logits.float(), dim=-1)
+        teacher_logps = F.log_softmax(teacher_logits.float(), dim=-1)
         student_probs = student_logps.exp()
 
         finite_teacher = torch.isfinite(teacher_logps)
@@ -92,7 +90,6 @@ class _VocabParallelFullVocabKL(torch.autograd.Function):
             teacher_probs = teacher_logps.exp()
             diff = torch.where(finite_teacher, teacher_logps - student_logps, torch.zeros_like(teacher_logps))
             per_token_kl = (teacher_probs * diff).sum(dim=-1)
-        torch.distributed.all_reduce(per_token_kl, op=torch.distributed.ReduceOp.SUM, group=tp_group)
 
         ctx.save_for_backward(student_probs, teacher_hidden, teacher_lm_head, per_token_kl)
         ctx.reverse = reverse
@@ -109,7 +106,7 @@ class _VocabParallelFullVocabKL(torch.autograd.Function):
             )
         elif teacher_logits.shape[-1] > student_probs.shape[-1]:
             teacher_logits = teacher_logits[..., : student_probs.shape[-1]]
-        teacher_logps = vocab_parallel_log_softmax(teacher_logits)
+        teacher_logps = F.log_softmax(teacher_logits.float(), dim=-1)
 
         if ctx.reverse:
             # d/dz_j KL(s||t) = s_j * ((log s_j - log t_j) - KL)
@@ -125,63 +122,73 @@ class _VocabParallelFullVocabKL(torch.autograd.Function):
         return grad.to(ctx.student_dtype), None, None, None
 
 
+def _teacher_lm_heads(distillation_config: DistillationConfig, device: torch.device) -> dict[str, torch.Tensor]:
+    """teacher_key -> full [V, H] frozen teacher lm_head (cached per worker)."""
+    loss_config = distillation_config.distillation_loss
+    return {
+        key: get_full_teacher_lm_head(
+            checkpoint_path=loss_config.full_vocab_lm_head_checkpoint or teacher_config.model_path,
+            layer=loss_config.full_vocab_lm_head_layer,
+            device=device,
+        )
+        for key, teacher_config in distillation_config.teacher_models.items()
+    }
+
+
 def _compute_full_vocab_kl(
     *,
     student_logits: torch.Tensor,
     data: TensorDict,
     config: DistillationConfig,
-    data_format: str,
-    teacher_lm_head_shards: dict[str, torch.Tensor],
     reverse: bool,
 ) -> dict[str, torch.Tensor]:
     device = student_logits.device
     artifacts = artifacts_of(data)
     loss_config = config.distillation_loss
+    teacher_lm_heads = _teacher_lm_heads(config, device)
 
-    # 1. Fetch teacher hidden states and build jagged [bsz, seqlen, H] tensors.
-    #    The last row of each sample is zeroed: it would predict a token past the
-    #    sequence end (no teacher target), and the norm-0 row doubles as the
-    #    structural marker consumed by the teacher_hidden_coverage metric.
-    teacher_keys = sorted(teacher_lm_head_shards.keys())
+    # 1. Fetch teacher hidden states, zero each sample's last row (structural
+    #    marker: no teacher target past the sequence end), and pack to
+    #    [1, total_nnz, H] exactly like the top-K teacher tensors.
+    teacher_keys = sorted(teacher_lm_heads.keys())
     teacher_index = {key: i for i, key in enumerate(teacher_keys)}
     hidden_rows, index_rows = [], []
     for i, artifact in enumerate(artifacts):
         if artifact["teacher_name"] not in teacher_index:
             raise KeyError(
-                f"full-vocab distillation: no teacher lm_head shard for teacher {artifact['teacher_name']!r} "
-                f"(sample {i}); loaded shards: {teacher_keys}."
+                f"full-vocab distillation: no teacher lm_head for teacher {artifact['teacher_name']!r} "
+                f"(sample {i}); loaded: {teacher_keys}."
             )
-        shard_dtype = teacher_lm_head_shards[artifact["teacher_name"]].dtype
-        hidden = fetch_teacher_hidden(artifact).to(device=device, dtype=shard_dtype)
+        hidden = fetch_teacher_hidden(artifact).to(
+            device=device, dtype=teacher_lm_heads[artifact["teacher_name"]].dtype
+        )
         hidden[-1] = 0
         hidden_rows.append(hidden)
         index_rows.append(
             torch.full((hidden.shape[0],), teacher_index[artifact["teacher_name"]], dtype=torch.long, device=device)
         )
-    teacher_hidden_nested = torch.nested.nested_tensor(hidden_rows, layout=torch.jagged)
-    teacher_index_nested = torch.nested.nested_tensor(index_rows, layout=torch.jagged)
+    teacher_hidden = torch.nested.nested_tensor(hidden_rows, layout=torch.jagged).values().unsqueeze(0)
+    teacher_tidx = torch.nested.nested_tensor(index_rows, layout=torch.jagged).values().unsqueeze(0)
 
-    # 2. Split across CP groups exactly like the top-k distillation path.
-    if data_format == "thd":
-        teacher_hidden_cp, *_ = preprocess_thd_engine(teacher_hidden_nested, pre_process=True)
-        teacher_index_cp, *_ = preprocess_thd_engine(teacher_index_nested, pre_process=True)
-    else:
-        teacher_hidden_cp, *_ = preprocess_bshd_engine(teacher_hidden_nested, pre_process=True)
-        teacher_index_cp, *_ = preprocess_bshd_engine(teacher_index_nested, pre_process=True)
-    assert teacher_hidden_cp.shape[:-1] == student_logits.shape[:-1], (
-        f"teacher hidden shape {teacher_hidden_cp.shape} does not match student logits "
-        f"shape {student_logits.shape} after CP split."
+    # 2. Diagnostics: per-token teacher hidden norm (0 on padded/structural rows).
+    teacher_hidden_norm = teacher_hidden.float().norm(dim=-1).detach()
+
+    # 3. Slice across the Ulysses SP group like the top-K path (dim=1 is the
+    #    packed sequence; trailing dims are preserved).
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_hidden = slice_input_tensor(teacher_hidden, dim=1)
+        teacher_tidx = slice_input_tensor(teacher_tidx, dim=1)
+        teacher_hidden_norm = slice_input_tensor(teacher_hidden_norm, dim=1)
+    assert teacher_hidden.shape[:2] == student_logits.shape[:2], (
+        f"teacher hidden shape {teacher_hidden.shape} does not match student logits "
+        f"shape {student_logits.shape} after SP slicing."
     )
 
-    # 3. Diagnostics: per-token teacher hidden norm (0 on padded/structural rows).
-    teacher_hidden_norm = teacher_hidden_cp.float().norm(dim=-1).detach()
-    teacher_hidden_norm = teacher_hidden_norm.reshape(student_logits.shape[:-1])
-
-    # 4. Chunked vocab-parallel KL. Rows are grouped by teacher inside each chunk
-    #    (multi-teacher micro batches select the matching lm_head shard per row).
+    # 4. Chunked full-vocab KL. Rows are grouped by teacher inside each chunk
+    #    (multi-teacher micro batches select the matching lm_head per row).
     student_flat = student_logits.reshape(-1, student_logits.shape[-1])
-    hidden_flat = teacher_hidden_cp.reshape(-1, teacher_hidden_cp.shape[-1])
-    index_flat = teacher_index_cp.reshape(-1)
+    hidden_flat = teacher_hidden.reshape(-1, teacher_hidden.shape[-1])
+    index_flat = teacher_tidx.reshape(-1)
     num_tokens = student_flat.shape[0]
     chunk_tokens = loss_config.full_vocab_chunk_tokens
 
@@ -201,10 +208,10 @@ def _compute_full_vocab_kl(
             if hi == lo:
                 continue
             per_teacher.append(
-                _VocabParallelFullVocabKL.apply(
+                _FullVocabKL.apply(
                     student_chunk[lo:hi],
                     hidden_chunk[lo:hi],
-                    teacher_lm_head_shards[key],
+                    teacher_lm_heads[key],
                     reverse,
                 )
             )
@@ -216,7 +223,7 @@ def _compute_full_vocab_kl(
     distillation_losses = torch.cat(loss_chunks, dim=0).reshape(student_logits.shape[:-1])
     return {
         "distillation_losses": distillation_losses,
-        "teacher_hidden_norm": teacher_hidden_norm,
+        "teacher_hidden_norm": teacher_hidden_norm.reshape(student_logits.shape[:-1]),
     }
 
 
@@ -225,30 +232,24 @@ def compute_forward_kl_full_vocab(
     student_logits: torch.Tensor,
     data: TensorDict,
     config: DistillationConfig,
-    data_format: str,
-    teacher_lm_head_shards: dict[str, torch.Tensor],
+    data_format: str = "thd",
+    teacher_lm_head_shards: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict[str, torch.Tensor]:
     """Full-vocabulary forward KL (teacher || student) per-token losses.
 
     Args:
-        student_logits: (bsz, seqlen/cp_size, vocab_size/tp_size), requires grad.
+        student_logits: (bsz, seqlen/sp_size, vocab_size), requires grad.
         data: micro batch carrying ``teacher_full_vocab_artifact`` per sample.
         config: DistillationConfig.
-        data_format: "thd" or "bshd".
-        teacher_lm_head_shards: teacher_key -> [V/tp, H] lm_head shard of this TP rank.
+        data_format: unused on the FSDP path (SP slicing is format-agnostic).
+        teacher_lm_head_shards: unused on the FSDP path; the full lm_head is
+            loaded and cached per worker (see ``get_full_teacher_lm_head``).
 
     Returns:
-        - distillation_losses: (bsz, seqlen/cp_size)
-        - teacher_hidden_norm: (bsz, seqlen/cp_size)
+        - distillation_losses: (bsz, seqlen/sp_size)
+        - teacher_hidden_norm: (bsz, seqlen/sp_size)
     """
-    return _compute_full_vocab_kl(
-        student_logits=student_logits,
-        data=data,
-        config=config,
-        data_format=data_format,
-        teacher_lm_head_shards=teacher_lm_head_shards,
-        reverse=False,
-    )
+    return _compute_full_vocab_kl(student_logits=student_logits, data=data, config=config, reverse=False)
 
 
 def compute_reverse_kl_full_vocab(
@@ -256,18 +257,11 @@ def compute_reverse_kl_full_vocab(
     student_logits: torch.Tensor,
     data: TensorDict,
     config: DistillationConfig,
-    data_format: str,
-    teacher_lm_head_shards: dict[str, torch.Tensor],
+    data_format: str = "thd",
+    teacher_lm_head_shards: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict[str, torch.Tensor]:
     """Full-vocabulary reverse KL (student || teacher) per-token losses.
 
     Same arguments and returns as :func:`compute_forward_kl_full_vocab`.
     """
-    return _compute_full_vocab_kl(
-        student_logits=student_logits,
-        data=data,
-        config=config,
-        data_format=data_format,
-        teacher_lm_head_shards=teacher_lm_head_shards,
-        reverse=True,
-    )
+    return _compute_full_vocab_kl(student_logits=student_logits, data=data, config=config, reverse=True)
