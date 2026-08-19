@@ -21,7 +21,7 @@ from verl.base_config import BaseConfig
 from verl.utils.config import omega_conf_to_dataclass
 
 from .engine import EngineConfig
-from .rollout import RolloutConfig, get_engine_pcp_size
+from .rollout import RolloutConfig
 
 __all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
 
@@ -170,9 +170,8 @@ class DistillationTeacherModelConfig(BaseConfig):
     num_replicas (int):
         Inference mode: number of inference replicas of this teacher to launch. Each
         replica occupies `per_replica_world_size` GPUs (= inference.data_parallel_size *
-        inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size *
-        inference.prefill_context_parallel_size), so the teacher's total GPU footprint is
-        `num_replicas * per_replica_world_size`.
+        inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size),
+        so the teacher's total GPU footprint is `num_replicas * per_replica_world_size`.
         Engine mode: `per_replica_world_size` is the model-parallel world size
         (megatron: tp * pp * cp; fsdp: 1) and `num_replicas` is the data-parallel size.
     """
@@ -201,8 +200,6 @@ class DistillationTeacherModelConfig(BaseConfig):
             self.inference.tensor_model_parallel_size
             * self.inference.data_parallel_size
             * self.inference.pipeline_model_parallel_size
-            # PCP (prefill context parallel) ranks are extra engine worker processes.
-            * self.inference.prefill_context_parallel_size
         )
 
     @property
@@ -407,9 +404,6 @@ class DistillationConfig(BaseConfig):
                     inference.tensor_model_parallel_size
                     * inference.data_parallel_size
                     * inference.pipeline_model_parallel_size
-                    # PCP (prefill context parallel) ranks are extra engine worker
-                    # processes; keep in sync with per_replica_world_size.
-                    * get_engine_pcp_size((inference.engine_kwargs or {}).get("vllm", {}) or {})
                 )
             pool_size = self.n_gpus_per_node * self.nnodes
             if pool_size % per_replica != 0:
