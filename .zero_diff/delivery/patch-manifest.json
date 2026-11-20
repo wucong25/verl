@@ -1,0 +1,27 @@
+{
+  "recorded_at": "2026-11-20T02:17:29.202424+00:00",
+  "status": "Full40 full-v1 passed: full-online-002; original FP32 exact across three weights and two native updates",
+  "patches": [
+    {
+      "repo": "/home/w00848261/verl",
+      "base": "622cd6c12b2796a3b541fe50babebf8aa3076799",
+      "patch": "verl.patch",
+      "bytes": 26330,
+      "sha256": "feeb6d58036f806946e3776aeffc328a2142e90ab8cfb4ad7cc2b88e504feee8"
+    },
+    {
+      "repo": "/vllm",
+      "base": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+      "patch": "vllm.patch",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "repo": "/vllm-ascend",
+      "base": "0c002b4b44cd2e7e12a094e6f778b62ed793afba",
+      "patch": "vllm-ascend.patch",
+      "bytes": 76678,
+      "sha256": "6cee0a04cbc12e678964f40d9ea6152bc07377704663a1708443d118a5ee2889"
+    }
+  ]
+}

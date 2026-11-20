@@ -1,0 +1,366 @@
+{
+  "run": "full-online-002",
+  "scope": "40-layer full model; native dual forward, two optimizer steps, resident IPC sync",
+  "passed": true,
+  "optimizer_steps": 2,
+  "phases": [
+    {
+      "version": 0,
+      "pd": {
+        "count": 64,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "mixed_batch": {
+        "count": 64,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "rollout_seconds": 13.82323670387268,
+      "recompute": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "optimizer": {
+        "api": "native engine.optimizer_step inside the same train_mode as forward_backward",
+        "grad_norm": 280.6439514160156
+      },
+      "grad_forward": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "grad_vs_recompute": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "native_seconds": 18.369966983795166,
+      "changed_parameters": [
+        1387,
+        1390,
+        1385,
+        1399,
+        1435,
+        1431,
+        1418,
+        1420,
+        1356,
+        1366,
+        1354,
+        1362,
+        1345,
+        1373,
+        1345,
+        1362
+      ],
+      "weight_sync_seconds": 12.021228551864624
+    },
+    {
+      "version": 1,
+      "pd": {
+        "count": 64,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "mixed_batch": {
+        "count": 64,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "rollout_seconds": 11.749419450759888,
+      "recompute": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "optimizer": {
+        "api": "native engine.optimizer_step inside the same train_mode as forward_backward",
+        "grad_norm": 43.78923416137695
+      },
+      "grad_forward": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "grad_vs_recompute": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "native_seconds": 11.372997760772705,
+      "changed_parameters": [
+        1418,
+        1399,
+        1405,
+        1421,
+        1447,
+        1447,
+        1436,
+        1441,
+        1378,
+        1382,
+        1384,
+        1386,
+        1377,
+        1404,
+        1370,
+        1390
+      ],
+      "weight_sync_seconds": 11.835860013961792
+    },
+    {
+      "version": 2,
+      "pd": {
+        "count": 64,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "mixed_batch": {
+        "count": 64,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "rollout_seconds": 11.720770359039307,
+      "recompute": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "grad_forward": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "grad_vs_recompute": {
+        "count": 128,
+        "mismatch": 0,
+        "max_abs": 0.0,
+        "finite": true,
+        "dtype": "torch.float32"
+      },
+      "native_seconds": 13.00205135345459
+    }
+  ],
+  "independent_audit": {
+    "audited_at": "2026-11-20T02:17:31.649011+00:00",
+    "passed": true,
+    "raw_tensor_checks": [
+      {
+        "version": 0,
+        "raw_tensor_count_per_native_path": 128,
+        "exact_equal": true
+      },
+      {
+        "version": 1,
+        "raw_tensor_count_per_native_path": 128,
+        "exact_equal": true
+      },
+      {
+        "version": 2,
+        "raw_tensor_count_per_native_path": 128,
+        "exact_equal": true
+      }
+    ],
+    "initial_sync_all_parameter_hashes_unchanged": true,
+    "resident_identities_unchanged": true,
+    "updates": [
+      {
+        "from_version": 0,
+        "changed_parameters_per_rank": [
+          1387,
+          1390,
+          1385,
+          1399,
+          1435,
+          1431,
+          1418,
+          1420,
+          1356,
+          1366,
+          1354,
+          1362,
+          1345,
+          1373,
+          1345,
+          1362
+        ],
+        "grad_norm": 280.6439514160156,
+        "device_ipc_receipts": 16
+      },
+      {
+        "from_version": 1,
+        "changed_parameters_per_rank": [
+          1418,
+          1399,
+          1405,
+          1421,
+          1447,
+          1447,
+          1436,
+          1441,
+          1378,
+          1382,
+          1384,
+          1386,
+          1377,
+          1404,
+          1370,
+          1390
+        ],
+        "grad_norm": 43.78923416137695,
+        "device_ipc_receipts": 16
+      }
+    ]
+  },
+  "model_geometry": {
+    "passed": true,
+    "weight_config_sha256": "51dc6211c7a2d97b9371842a5ba4baad9c8ca8ffd64247c4fe6f254044a108b0",
+    "num_hidden_layers": 40,
+    "hidden_size": 2048,
+    "num_experts": 256,
+    "training_topology": {
+      "tensor_model_parallel_size": 2,
+      "pipeline_model_parallel_size": 2,
+      "expert_model_parallel_size": 8,
+      "expert_tensor_parallel_size": 1,
+      "context_parallel_size": 1
+    },
+    "native": [
+      {
+        "rank": 0,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 1,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 2,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 3,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 4,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 5,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 6,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 7,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 8,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 9,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 10,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 11,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 12,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 13,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 14,
+        "local_language_layers": 20
+      },
+      {
+        "rank": 15,
+        "local_language_layers": 20
+      }
+    ],
+    "rollout": [
+      {
+        "rank": 0,
+        "language_layers": 40
+      },
+      {
+        "rank": 1,
+        "language_layers": 40
+      },
+      {
+        "rank": 2,
+        "language_layers": 40
+      },
+      {
+        "rank": 3,
+        "language_layers": 40
+      },
+      {
+        "rank": 4,
+        "language_layers": 40
+      },
+      {
+        "rank": 5,
+        "language_layers": 40
+      },
+      {
+        "rank": 6,
+        "language_layers": 40
+      },
+      {
+        "rank": 7,
+        "language_layers": 40
+      }
+    ]
+  },
+  "source_audit": {
+    "passed": true,
+    "source_manifest_sha256": "adc524503e264f7e29eeabfa59dbbcf59197f1b840f448d38e46d8eb598a1d37",
+    "file_count": 51,
+    "mismatches": []
+  },
+  "full_evidence_location": "/home/w00848261/verl/.zero_diff/runs/full-online-002"
+}

@@ -1,0 +1,6 @@
+{
+  "bash_syntax": true,
+  "cli_help": true,
+  "main_ast_equal_except_run_path_and_ipc_job": true,
+  "additional_full_npu_run": false
+}

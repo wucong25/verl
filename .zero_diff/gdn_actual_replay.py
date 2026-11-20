@@ -1,0 +1,43 @@
+import json,traceback
+from pathlib import Path
+import megatron_adaptor
+import torch
+from safetensors import safe_open
+from verl.utils.kernel.npu.fla_compat import register_fla_legacy_ops
+from mindspeed_bridge.features.megatron.common.fla_npu_causal_conv1d import fla_npu_causal_conv1d
+from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.flash_gated_delta_rule import flash_gated_delta_rule
+from fla.modules.l2norm import l2norm
+root=Path('/home/w00848261/verl/.zero_diff/runs/gdn-actual-001');root.mkdir(exist_ok=True)
+report={}
+def cmp(a,b):
+ a,b=a.detach().cpu(),b.detach().cpu();assert a.shape==b.shape,(a.shape,b.shape)
+ return {'count':a.numel(),'mismatch':int((a!=b).sum()),'max_abs':float((a.float()-b.float()).abs().max())}
+try:
+ torch.npu.set_device(8);register_fla_legacy_ops()
+ train=Path('/home/w00848261/verl/.zero_diff/runs/proxy-megatron-003/trace/rank0')
+ infer=Path('/home/w00848261/verl/.zero_diff/runs/proxy-vllm-008/trace')
+ prefix='chunk0.module.module.language_model.decoder.layers.0.self_attention.'
+ projection=torch.load(train/(prefix+'in_proj.000.pt'),weights_only=True)['output'][0].transpose(0,1).npu()
+ qkv,z,b,a=projection.split([4096,2048,16,16],dim=-1)
+ ckpt=Path('/mnt/weight/Qwen3.5-35B-A3B');index=json.loads((ckpt/'model.safetensors.index.json').read_text())['weight_map']
+ def weight(s):
+  name='model.language_model.layers.0.linear_attn.'+s
+  with safe_open(str(ckpt/index[name]),framework='pt',device='cpu') as f:return f.get_tensor(name).npu()
+ w=weight('conv1d.weight').squeeze(1)
+ w=torch.cat([w[:1024],w[2048:3072],w[4096:6144]]).contiguous()
+ A_log=weight('A_log')[:16];dt=weight('dt_bias')[:16]
+ with torch.no_grad():
+  conv,_=fla_npu_causal_conv1d(qkv.contiguous(),w,activation='silu')
+  q,k,v=conv.split([1024,1024,2048],dim=-1)
+  q=l2norm(q.reshape(1,144,8,128).contiguous()).repeat_interleave(2,dim=2)
+  k=l2norm(k.reshape(1,144,8,128).contiguous()).repeat_interleave(2,dim=2)
+  v=v.reshape(1,144,16,128).contiguous()
+  ref=torch.load(train/(prefix+'out_norm.000.pt'),weights_only=True)['inputs'][0].reshape(1,144,16,128)
+  inf=torch.load(infer/'language_model.model.layers.0.linear_attn.norm.016.pt',weights_only=True)['inputs'][0].reshape(1,144,4,128)
+  for dtype in [torch.bfloat16,torch.float32]:
+   g=-A_log.to(dtype).exp()*torch.nn.functional.softplus(a.float()+dt)
+   out,_=flash_gated_delta_rule(q,k,v,g,b.sigmoid(),scale=128**-0.5,use_qk_l2norm_in_kernel=False)
+   report[str(dtype)]={'vs_native':cmp(out,ref),'vs_infer_first4':cmp(out[:,:,:4],inf)}
+except Exception:report['error']=traceback.format_exc()
+finally:
+ (root/'result.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2),flush=True)

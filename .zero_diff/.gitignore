@@ -1,0 +1,13 @@
+*
+!/.gitignore
+!/*.py
+!/*.sh
+!/README.md
+!/review/
+!/review/*.md
+!/delivery/
+!/delivery/README.md
+!/delivery/*.patch
+!/delivery/patch-manifest.json
+!/delivery/cli-validation.json
+!/delivery/verification-summary.json

@@ -1,0 +1,523 @@
+diff --git a/verl/utils/megatron/tensor_parallel.py b/verl/utils/megatron/tensor_parallel.py
+index dc7a3f81..63f6c92d 100644
+--- a/verl/utils/megatron/tensor_parallel.py
++++ b/verl/utils/megatron/tensor_parallel.py
+@@ -203,10 +203,17 @@ def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.
+     return (sum_exp_squared / sum_exp.pow(2)).squeeze(dim=-1)
+ 
+ 
+-def vocab_parallel_log_probs_from_logits(logits, labels):
++def vocab_parallel_log_probs_from_logits(logits, labels, npu_batch_invariant_reduction=False):
+     """TODO(zhangchi.usc1992): We may change the implementation later"""
+     from megatron.core import tensor_parallel
+ 
++    if npu_batch_invariant_reduction:
++        if logits.device.type != "npu":
++            raise ValueError("npu_batch_invariant_reduction requires NPU logits")
++        from verl.utils.kernel.npu.vocab_reduction import NpuVocabReductionMode
++
++        with NpuVocabReductionMode(logits.shape[-1]):
++            return -tensor_parallel.vocab_parallel_cross_entropy(vocab_parallel_logits=logits, target=labels)
+     return -tensor_parallel.vocab_parallel_cross_entropy(vocab_parallel_logits=logits, target=labels)
+ 
+ 
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index e47ec921..6eaa911f 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -353,6 +353,13 @@ def make_megatron_module(
+             ddp_config = DistributedDataParallelConfig(**ddp_config_dict)
+             ddp_config.finalize()
+ 
++    # Select the wrapper before DDP constructs dtype-specific parameter buffers.
++    precision_kwargs = {}
++    if override_model_config.get("preserve_gdn_a_log_fp32", False):
++        from verl.models.mcore.npu_precision import GDNFloat16Module
++
++        precision_kwargs["mixed_precision_wrapper"] = GDNFloat16Module
++
+     # Now call provide_distributed_model with all hooks registered
+     # Hooks will be applied automatically before DDP wrapping
+     model = provider.provide_distributed_model(
+@@ -361,6 +368,7 @@ def make_megatron_module(
+         fp16=provider.fp16,
+         bf16=provider.bf16,
+         use_megatron_fsdp=wrap_config.use_megatron_fsdp,
++        **precision_kwargs,
+     )
+ 
+     if layer_wise_ddp:
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 86a60370..2204a762 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -546,6 +546,22 @@ class MegatronEngine(BaseEngine):
+ 
+     def initialize(self):
+         self._hf_export_tasks = None
++        self._fla_registration = None
++        if get_device_name() == "npu" and self.engine_config.override_transformer_config.get(
++            "use_ascend_gdn", False
++        ):
++            from verl.utils.kernel.npu.fla_compat import register_fla_legacy_ops
++
++            self._fla_registration, registered_ops = register_fla_legacy_ops()
++            if registered_ops:
++                logger.info("Registered split FLA compatibility operators: %s", registered_ops)
++        self._batch_invariant_registration = None
++        if self.engine_config.override_mcore_model_config.get("npu_batch_invariant_matmul", False):
++            if get_device_name() != "npu":
++                raise ValueError("npu_batch_invariant_matmul requires the NPU backend")
++            from verl.utils.kernel.npu.batch_invariant import enable_batch_invariant_matmul
++
++            self._batch_invariant_registration = enable_batch_invariant_matmul()
+         self._build_tf_config()
+         _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
+ 
+@@ -1021,6 +1037,12 @@ class MegatronEngine(BaseEngine):
+             return None
+         if self._hf_export_tasks is None:
+             self._hf_export_tasks = self.bridge.get_conversion_tasks(self.module)
++            if self.engine_config.override_mcore_model_config.get("preserve_gdn_norm_export_fp32", False):
++                if get_device_name() != "npu":
++                    raise ValueError("preserve_gdn_norm_export_fp32 requires the NPU backend")
++                from verl.models.mcore.npu_weight_export import preserve_gdn_norm_export_fp32
++
++                self._hf_export_tasks = preserve_gdn_norm_export_fp32(self._hf_export_tasks)
+         return self._hf_export_tasks
+ 
+     def get_per_tensor_param(self, base_sync_done=False, **kwargs):
+@@ -1245,7 +1267,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         if not distillation_only:
+             # the cross entropy shifts fp32 logits in place; the score centering hook re-reads them in backward
+             ret["log_probs"] = vocab_parallel_log_probs_from_logits(
+-                logits_bak.clone() if score_centering else logits_bak, label
++                logits_bak.clone() if score_centering else logits_bak,
++                label,
++                npu_batch_invariant_reduction=self.engine_config.override_mcore_model_config.get(
++                    "npu_batch_invariant_reduction", False
++                ),
+             )
+ 
+         return ret
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+index 44408511..963251f0 100644
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -32,6 +32,15 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+ 
+ 
++def weight_sync_zmq_handle(job_id, replica_rank, local_rank) -> str:
++    """Use a shared, configurable IPC directory on trainer and rollout workers."""
++    directory = os.environ.get("VERL_WEIGHT_SYNC_IPC_DIR", "/tmp")
++    if not os.path.isabs(directory):
++        raise ValueError("VERL_WEIGHT_SYNC_IPC_DIR must be an absolute directory")
++    filename = f"rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{local_rank}.sock"
++    return "ipc://" + os.path.join(directory, filename)
++
++
+ class TensorMetadata(TypedDict):
+     name: str
+     shape: torch.Size
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 63c76d5c..fe7fd204 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -41,7 +41,7 @@ from verl.utils.vllm.vllm_quant_utils import (
+     process_quanted_weights_after_loading,
+ )
+ from verl.utils.vllm.vllm_unquant_utils import fold_unquantized_moe_params, stage_unquantized_moe_params
+-from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
++from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver, weight_sync_zmq_handle
+ from verl.workers.rollout.vllm_rollout.weight_update_utils import (
+     apply_buffer_updates,
+     drop_tied_alias_updates,
+@@ -462,7 +462,7 @@ class vLLMColocateWorkerExtension:
+         local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)
+         trainer_rank_base = os.environ.get("VERL_ZMQ_BASE_TRAINER_RANK")
+         trainer_rank = int(trainer_rank_base) + local_rank if trainer_rank_base is not None else local_rank
+-        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
++        return weight_sync_zmq_handle(job_id, replica_rank, trainer_rank)
+ 
+     def update_verl_delta_weights(self, update_info: dict) -> None:
+         """Add this worker's IPC endpoint and forward the delta update to vLLM."""
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout.py b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+index 79a08d5d..5c82b9e1 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+@@ -40,7 +40,7 @@ from verl.third_party.vllm import VLLM_SLEEP_LEVEL
+ from verl.utils.device import is_support_ipc
+ from verl.workers.config import HFModelConfig, RolloutConfig
+ from verl.workers.rollout.base import BaseRollout
+-from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
++from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender, weight_sync_zmq_handle
+ 
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+@@ -138,7 +138,7 @@ class ServerAdapter(BaseRollout):
+         # stale socket file) cannot collide on the shared /tmp namespace.
+         local_rank = self.rollout_rank % local_world_size
+         job_id = ray.get_runtime_context().get_job_id()
+-        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
++        self.zmq_handle = weight_sync_zmq_handle(job_id, self.replica_rank, local_rank)
+ 
+         self.use_shm = not is_support_ipc()
+         self._delta_weight_transfer_engine_initialized = False
+diff --git a/tests/utils/kernel/test_npu_training_matmul.py b/tests/utils/kernel/test_npu_training_matmul.py
+new file mode 100644
+index 00000000..287c616f
+--- /dev/null
++++ b/tests/utils/kernel/test_npu_training_matmul.py
+@@ -0,0 +1,74 @@
++# Copyright 2026 The verl team.
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++"""Exercise the shared GEMM dispatch without leaking registrations to other tests."""
++
++import multiprocessing
++
++import pytest
++
++
++def _check_training_dispatch():
++    import torch
++    import torch_npu  # noqa: F401
++    from vllm_ascend.ops.triton.batch_invariant.matmul import linear_persistent
++
++    from verl.utils.kernel.npu.batch_invariant import enable_batch_invariant_matmul
++
++    torch.npu.set_device(0)
++    torch.manual_seed(42)
++    a = torch.randn(65, 256, dtype=torch.bfloat16, device="npu", requires_grad=True)
++    b = torch.randn(256, 128, dtype=torch.bfloat16, device="npu", requires_grad=True)
++    dy = torch.randn(65, 128, dtype=torch.bfloat16, device="npu")
++    dx_ref = dy.cpu().double() @ b.detach().cpu().double().t()
++    dw_ref = a.detach().cpu().double().t() @ dy.cpu().double()
++    enable_batch_invariant_matmul()
++    actual = torch.matmul(a, b)
++    actual.backward(dy)
++    for gradient, reference in ((a.grad, dx_ref), (b.grad, dw_ref)):
++        assert gradient is not None and torch.isfinite(gradient).all()
++        difference = gradient.cpu().double() - reference
++        assert torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(reference) < 0.01
++    linear_input = a.detach().clone().requires_grad_(True)
++    linear_weight = b.detach().t().contiguous().requires_grad_(True)
++    bias = torch.zeros(128, dtype=torch.bfloat16, device="npu", requires_grad=True)
++    linear_output = torch.nn.functional.linear(linear_input, linear_weight, bias)
++    linear_output.backward(dy)
++    assert torch.equal(linear_output, actual)
++    assert torch.equal(linear_input.grad, a.grad)
++    assert torch.equal(linear_weight.grad, b.grad.t())
++    assert torch.equal(bias.grad, dy.sum(dim=0))
++    with torch.no_grad():
++        assert torch.equal(actual, linear_persistent(a, b.t()))
++        assert torch.equal(actual, torch.cat([torch.matmul(part, b) for part in a.split([1, 63, 1])]))
++        assert torch.equal(actual, torch.cat([torch.matmul(a, part) for part in b.split(32, dim=1)], dim=1))
++        # MRoPE's batched outer products must retain broadcast semantics.
++        freq = torch.randn(3, 1, 16, 1, device="npu")
++        pos = torch.arange(144, dtype=torch.float32, device="npu").reshape(1, 1, 1, 144)
++        assert torch.equal(torch.matmul(freq, pos), freq * pos)
++        # Exact integer products check vector squeezing and general batch shapes.
++        for ashape, bshape in [((16,), (16,)), ((16,), (2, 16, 7)), ((2, 7, 16), (16,)),
++                              ((2, 1, 7, 16), (3, 16, 5))]:
++            left = (torch.arange(torch.tensor(ashape).prod()).reshape(ashape) % 7 - 3).float()
++            right = (torch.arange(torch.tensor(bshape).prod()).reshape(bshape) % 5 - 2).float()
++            expected = left @ right
++            assert torch.equal(torch.matmul(left.npu(), right.npu()).cpu(), expected)
++
++
++def test_native_autograd_and_rollout_gemm_agree():
++    torch = pytest.importorskip("torch")
++    pytest.importorskip("torch_npu")
++    pytest.importorskip("vllm_ascend")
++    if not torch.npu.is_available():
++        pytest.skip("Requires an Ascend NPU")
++    process = multiprocessing.get_context("spawn").Process(target=_check_training_dispatch)
++    process.start()
++    try:
++        process.join(timeout=180)
++        assert process.exitcode == 0, f"NPU GEMM subprocess failed or timed out: {process.exitcode}"
++    finally:
++        if process.is_alive():
++            process.kill()
++            process.join()
++        process.close()
+diff --git a/tests/utils/npu/test_vocab_reduction.py b/tests/utils/npu/test_vocab_reduction.py
+new file mode 100644
+index 00000000..a9505de1
+--- /dev/null
++++ b/tests/utils/npu/test_vocab_reduction.py
+@@ -0,0 +1,26 @@
++# Copyright 2026 The verl team.
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++import torch
++import torch_npu  # noqa: F401
++
++from verl.utils.kernel.npu.vocab_reduction import NpuVocabReductionMode
++from vllm_ascend.ops.training_reduction import fixed_vocab_sum
++
++
++def test_scoped_dispatch_and_native_sum_autograd():
++    torch.manual_seed(31)
++    value = torch.rand(3, 124160, device='npu', requires_grad=True)
++    reference = fixed_vocab_sum(value.detach())
++    with NpuVocabReductionMode(124160):
++        result = value.sum(-1)
++        kept = value.sum(dim=1, keepdim=True)
++        cpu = torch.arange(5).sum(-1)
++    assert torch.equal(result, reference)
++    assert torch.equal(kept[:, 0], reference)
++    assert cpu.item() == 10
++    result.sum().backward()
++    assert torch.equal(value.grad, torch.ones_like(value))
++    # Exiting the context must restore the ordinary backend dispatch.
++    ordinary = value.detach().sum(-1)
++    assert torch.equal(ordinary, torch.ops.aten.sum.dim_IntList(value.detach(), [-1]))
+diff --git a/verl/models/mcore/npu_precision.py b/verl/models/mcore/npu_precision.py
+new file mode 100644
+index 00000000..5eb5ee75
+--- /dev/null
++++ b/verl/models/mcore/npu_precision.py
+@@ -0,0 +1,26 @@
++# Copyright 2026 The verl team.
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++# http://www.apache.org/licenses/LICENSE-2.0
++"""Mixed-precision wrapping that preserves the GDN checkpoint decay parameter."""
++
++import torch
++from megatron.core.ssm.gated_delta_net import GatedDeltaNet
++from megatron.core.transformer.module import Float16Module
++
++
++class GDNFloat16Module(Float16Module):
++    """Keep A_log in FP32 before DDP buffers and checkpoint loading are built.
++
++    Qwen3.5 checkpoints store this parameter in FP32. The default wrapper casts
++    every parameter to BF16 and changes the decay exponential's evaluation dtype.
++    This exponential affects every recurrent step. Parameter identity and TP
++    attributes are preserved so native optimizers and weight export still own it.
++    """
++
++    def __init__(self, config, module):
++        super().__init__(config, module)
++        for child in self.module.modules():
++            if isinstance(child, GatedDeltaNet):
++                child.A_log.data = child.A_log.data.to(torch.float32)
+diff --git a/verl/models/mcore/npu_weight_export.py b/verl/models/mcore/npu_weight_export.py
+new file mode 100644
+index 00000000..a22ac83e
+--- /dev/null
++++ b/verl/models/mcore/npu_weight_export.py
+@@ -0,0 +1,43 @@
++# Copyright 2026 The verl team.
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++"""Preserve the native GDN norm's effective FP32 gamma during HF export."""
++
++from dataclasses import replace
++
++
++class GDNFP32NormExportMapping:
++    """Retain Bridge's distribution, but add one with native forward precision.
++
++    The trainer stores a BF16 zero-centered delta and evaluates delta.float()+1.
++    Rounding this effective gamma back to BF16 on export changes the function,
++    even without an optimizer update. Wrap only the export conversion task;
++    neither the source parameter nor Bridge's global mapping class is changed.
++    """
++
++    def __init__(self, base_mapping):
++        self._base_mapping = base_mapping
++
++    def __getattr__(self, name):
++        return getattr(self._base_mapping, name)
++
++    def megatron_to_hf(self, megatron_weights, megatron_module):
++        from megatron.bridge.models.conversion.param_mapping import AutoMapping
++
++        # The parent mapping performs the original TP gather and PP broadcast.
++        # Its RMSNorm subclass adds one in the stored dtype; do that last step
++        # here in FP32 instead, matching the native forward's gamma exactly.
++        values = AutoMapping.megatron_to_hf(self._base_mapping, megatron_weights, megatron_module)
++        return {name: value.float() + 1.0 for name, value in values.items()}
++
++
++def preserve_gdn_norm_export_fp32(tasks):
++    from megatron.bridge.models.conversion.param_mapping import RMSNorm2ZeroCenteredRMSNormMapping
++
++    return [
++        replace(task, mapping=GDNFP32NormExportMapping(task.mapping))
++        if isinstance(task.mapping, RMSNorm2ZeroCenteredRMSNormMapping)
++        and task.global_param_name.endswith(".self_attention.out_norm.weight")
++        else task
++        for task in tasks
++    ]
+diff --git a/verl/utils/kernel/npu/batch_invariant.py b/verl/utils/kernel/npu/batch_invariant.py
+new file mode 100644
+index 00000000..f2e45744
+--- /dev/null
++++ b/verl/utils/kernel/npu/batch_invariant.py
+@@ -0,0 +1,72 @@
++# Copyright 2026 The verl team.
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++"""Opt-in NPU GEMM dispatch shared with the Ascend rollout linear kernel."""
++
++from functools import lru_cache
++
++import torch
++
++
++@lru_cache(maxsize=1)
++def enable_batch_invariant_matmul():
++    """Keep native Megatron modules/autograd and replace only NPU GEMM dispatch.
++
++    Ascend rollout linear uses a fixed K=256 accumulation. Its separate mm
++    fallback uses K=64 and is not numerically interchangeable. Route dense
++    matrix products to the linear kernel on both sides. No CPU/CUDA dispatch
++    or fused attention/normalization operator is changed.
++    """
++    from vllm_ascend.ops.triton.batch_invariant.matmul import linear_batch_invariant, linear_persistent
++
++    def matmul(a, b, *, out=None):
++        if a.ndim == 0 or b.ndim == 0:
++            raise ValueError("matmul operands must have at least one dimension")
++        left_vector, right_vector = a.ndim == 1, b.ndim == 1
++        left = a.unsqueeze(0) if left_vector else a
++        right = b.unsqueeze(-1) if right_vector else b
++        if right.ndim == 2:
++            result = linear_persistent(left.reshape(-1, left.shape[-1]), right.transpose(0, 1))
++            result = result.reshape(*left.shape[:-1], right.shape[-1])
++        else:
++            batch_shape = torch.broadcast_shapes(left.shape[:-2], right.shape[:-2])
++            rows, inner, columns = left.shape[-2], left.shape[-1], right.shape[-1]
++            left = left.expand(*batch_shape, rows, inner).reshape(-1, rows, inner)
++            right = right.expand(*batch_shape, inner, columns).reshape(-1, inner, columns)
++            if left.shape[0] == 0:
++                result = a.new_empty((*batch_shape, rows, columns))
++            else:
++                result = torch.stack([
++                    linear_persistent(x, y.transpose(0, 1)) for x, y in zip(left, right)
++                ]).reshape(*batch_shape, rows, columns)
++        if left_vector:
++            result = result.squeeze(-2)
++        if right_vector:
++            result = result.squeeze(-1)
++        if out is not None:
++            out.copy_(result)
++            return out
++        return result
++
++    def addmm(input, mat1, mat2, *, beta=1, alpha=1):
++        result = matmul(mat1, mat2)
++        if alpha != 1:
++            result = result * alpha
++        if beta != 0:
++            result = result + input * beta
++        return result
++
++    def differentiable_linear(input, weight, bias=None):
++        # The generated linear backward is unavailable on this NPU stack.
++        # Native matmul/add autograd supplies the full input/weight/bias gradients.
++        result = torch.matmul(input, weight.transpose(0, 1))
++        return result if bias is None else result + bias
++
++    library = torch.library.Library("aten", "IMPL")
++    library.impl("mm", matmul, "NPU")
++    library.impl("matmul", matmul, "NPU")
++    library.impl("linear", linear_batch_invariant, "NPU")
++    library.impl("linear", differentiable_linear, "AutogradPrivateUse1")
++    library.impl("addmm", addmm, "NPU")
++    return library
+diff --git a/verl/utils/kernel/npu/fla_compat.py b/verl/utils/kernel/npu/fla_compat.py
+new file mode 100644
+index 00000000..3efdcf35
+--- /dev/null
++++ b/verl/utils/kernel/npu/fla_compat.py
+@@ -0,0 +1,38 @@
++# Copyright 2026 verl contributors
++# SPDX-License-Identifier: Apache-2.0
++"""Bridge split FLA packages to the legacy MindSpeed GDN dispatcher API."""
++
++from functools import lru_cache
++
++import torch
++
++SCHEMAS = {
++    'npu_causal_conv1d': '(Tensor x, Tensor weight, Tensor? bias=None, Tensor(a!)? conv_states=None, *, int[]? query_start_loc=None, int[]? cache_indices=None, int[]? initial_state_mode=None, int[]? num_accepted_tokens=None, int activation_mode=0, int pad_slot_id=-1, int run_mode=0, int head_num=0) -> Tensor',
++    'npu_recompute_w_u_fwd': '(Tensor k, Tensor v, Tensor beta, Tensor A, int chunk_size, *, Tensor? g=None, Tensor? gk=None, int[]? cu_seqlens=None, int[]? chunk_indices=None) -> (Tensor, Tensor)',
++    'npu_chunk_gated_delta_rule_fwd_h': '(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool output_final_state=False, int? chunk_size=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool state_v_first=False) -> (Tensor, Tensor, Tensor?)',
++    'npu_chunk_fwd_o': '(Tensor q, Tensor k, Tensor v, Tensor h, float scale, *, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, int? chunk_size=None) -> Tensor',
++    'npu_chunk_bwd_dv_local': '(Tensor q, Tensor k, Tensor d_o, Tensor g, float scale, int chunk_size, *, Tensor? g_gamma=None, Tensor? A=None, int[]? cu_seqlens=None, int[]? chunk_indices=None) -> Tensor',
++    'npu_chunk_gated_delta_rule_bwd_dhu': '(Tensor q, Tensor k, Tensor w, Tensor d_o, Tensor dv, float scale, int chunk_size, *, Tensor? g=None, Tensor? gK=None, Tensor? h0=None, Tensor? dht=None, int[]? cu_seqlens=None, int[]? chunk_indices=None) -> (Tensor, Tensor?, Tensor)',
++    'npu_chunk_bwd_dqkwg': '(Tensor q, Tensor k, Tensor v, Tensor g, Tensor h, Tensor dox, Tensor dh, Tensor dv, int chunk_size, *, int[]? cu_seqlens=None, int[]? chunk_indices=None, float? scale=None) -> (Tensor, Tensor, Tensor, Tensor)',
++    'npu_prepare_wy_repr_bwd_da': '(Tensor k, Tensor v, Tensor beta, Tensor A, Tensor dw, Tensor du, Tensor g, *, int chunk_size, int[]? cu_seqlens=None, int[]? chunk_indices=None) -> Tensor',
++    'npu_prepare_wy_repr_bwd_full': '(Tensor k, Tensor v, Tensor beta, Tensor A, Tensor dA, Tensor dw, Tensor du, Tensor g, int chunk_size, *, int[]? cu_seqlens=None, int[]? chunk_indices=None) -> (Tensor, Tensor, Tensor, Tensor)',
++}
++
++@lru_cache(maxsize=1)
++def register_fla_legacy_ops():
++    """Register absent ops once and retain the dispatcher handle for this process.
++
++    Existing native extensions take precedence. This preserves MindSpeed's
++    custom autograd function while using FLA's supported direct-call API.
++    """
++    from fla_npu.ops import ascendc
++
++    lib = torch.library.Library('npu', 'FRAGMENT')
++    registered = []
++    for name, schema in SCHEMAS.items():
++        if hasattr(torch.ops.npu, name):
++            continue
++        lib.define(name + schema)
++        lib.impl(name, getattr(ascendc, name), 'PrivateUse1')
++        registered.append(name)
++    return lib, registered
+diff --git a/verl/utils/kernel/npu/vocab_reduction.py b/verl/utils/kernel/npu/vocab_reduction.py
+new file mode 100644
+index 00000000..8a5a0c13
+--- /dev/null
++++ b/verl/utils/kernel/npu/vocab_reduction.py
+@@ -0,0 +1,36 @@
++# Copyright 2026 The verl team.
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++"""Scoped batch-invariant reduction for the native Megatron vocabulary CE."""
++
++import torch
++from torch.utils._python_dispatch import TorchDispatchMode
++
++
++class NpuVocabReductionMode(TorchDispatchMode):
++    """Change only the FP32 vocabulary sum; retain native CE and its backward."""
++
++    def __init__(self, vocab_width: int):
++        super().__init__()
++        self.vocab_width = vocab_width
++
++    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
++        kwargs = kwargs or {}
++        if func == torch.ops.aten.sum.dim_IntList:
++            value = args[0]
++            dims = args[1] if len(args) > 1 else kwargs.get("dim")
++            keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
++            dtype = kwargs.get("dtype")
++            if (
++                value.device.type == "npu"
++                and value.dtype == torch.float32
++                and value.ndim > 0
++                and value.shape[-1] == self.vocab_width
++                and dims is not None
++                and list(dims) in ([-1], [value.ndim - 1])
++                and dtype in (None, torch.float32)
++            ):
++                from vllm_ascend.ops.training_reduction import fixed_vocab_sum
++
++                return fixed_vocab_sum(value, keepdim=keepdim)
++        return func(*args, **kwargs)
