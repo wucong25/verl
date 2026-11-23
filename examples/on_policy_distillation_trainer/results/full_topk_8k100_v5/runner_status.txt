@@ -1,0 +1,6 @@
+{"status": "unchanged", "manifest_sha256": "b1b1e345e9494b684118798f310ea9a2377dcd00b0016246cb44309f5dc60e8b"}
+{"idle": true, "process_count": 0, "utc": "2026-11-21T14:36:24.255262+00:00"}
+2026-11-21T14:36:24Z start forward_kl_full_seed42_steps100_response8192_v5
+{"status": "unchanged", "manifest_sha256": "b1b1e345e9494b684118798f310ea9a2377dcd00b0016246cb44309f5dc60e8b"}
+2026-11-22T09:23:13Z finish forward_kl_full_seed42_steps100_response8192_v5 exit=0
+2026-11-22T09:23:13Z start forward_kl_topk_seed42_steps100_response8192_v5

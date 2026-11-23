@@ -1,0 +1,116 @@
+{
+  "export_date": "2026-11-23 Asia/Shanghai",
+  "code_commit": "4b5dc8502b12a3faf860b290cdfc862270ddb40a",
+  "runs": {
+    "full": {
+      "metrics_sha256": "66dabf8c456c0acbe8be282f0abfb03ec38cc5c715de9477b4a8319c4d03e1fc",
+      "raw_taskrunner_sha256": "c8b6e0431f7408157d549ca3c1da77c629716bcc982900db6daba285d822372c",
+      "source_bytes_observed": 453404,
+      "source": "/home/w00848261/verl/.ray/session_2026-11-21_14-36-42_968770_3032604/logs/worker-2568381ddcf1b95af7c218c77139fbea639c488d08e234d811674b42-01000000-3069318.out",
+      "saved_metrics_match_current_source": true
+    },
+    "topk": {
+      "metrics_sha256": "e472bf26aad530308db7e1cf2a521cce6b6627371af5f0ca551f19e130f9a6bf",
+      "raw_taskrunner_sha256": "1044114eabdce9eea86bbfbd3091126bbc9037b32096e4ee4144b8f11d4b6e88",
+      "source_bytes_observed": 459883,
+      "source": "/home/w00848261/verl/.ray/session_2026-11-22_09-23-31_996394_3558590/logs/worker-a8803df5a26dfb28bd53041398719245f2fd2a160e1e689ea54e479b-01000000-3595314.out",
+      "saved_metrics_match_current_source": true
+    }
+  },
+  "manifest_sha256": "9d534d344f65a3c5b0069a8b0fead3f1df41daac4a976ce1be5c9569f48a930b",
+  "source_checks": {
+    "verl/trainer/distillation/full_vocab.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/distillation/full_vocab_loss.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/workers/engine/full_vocab.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/experimental/teacher_loop/training_teacher.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "examples/on_policy_distillation_trainer/full_vocab_preflight.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "tests/workers/test_full_vocab_kl_on_cpu.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "tests/workers/test_engine_full_vocab_on_cpu.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "tests/workers/test_training_teacher_on_cpu.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "tests/special_distributed/test_full_vocab_kl_on_npu.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/distillation/losses.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/workers/config/distillation.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/ppo/v1/trainer_base.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/experimental/teacher_loop/teacher_model.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/experimental/teacher_loop/teacher_manager.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/experimental/agent_loop/agent_loop.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/workers/engine/fsdp/transformer_impl.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/workers/engine/megatron/transformer_impl.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/workers/engine_workers.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/utils/tensordict_utils.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/utils/transferqueue_utils.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "tests/utils/test_padding_on_cpu.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "examples/on_policy_distillation_trainer/validate_training_teacher_910c.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "examples/on_policy_distillation_trainer/geometry_accuracy.py": {
+      "matches_manifest_lf_normalized": true
+    },
+    "examples/on_policy_distillation_trainer/full_vocab.rst": {
+      "matches_manifest_lf_normalized": true
+    },
+    "examples/on_policy_distillation_trainer/run_qwen35_full_opd_910c.sh": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/config/distillation/distillation.yaml": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/config/_generated_ppo_megatron_trainer.yaml": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/config/_generated_ppo_trainer.yaml": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml": {
+      "matches_manifest_lf_normalized": true
+    },
+    "verl/trainer/config/_generated_ppo_veomni_trainer.yaml": {
+      "matches_manifest_lf_normalized": true
+    },
+    "examples/on_policy_distillation_trainer/summarize_full_vocab_comparison.py": {
+      "matches_manifest_lf_normalized": true
+    }
+  }
+}

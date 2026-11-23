@@ -4,6 +4,15 @@ Full-vocabulary on-policy distillation
 This branch reimplements the idea in https://github.com/verl-project/verl/pull/7375
 on local main (909bb913), obtaining teacher logits from verl training engines.
 
+Saved training curves and statistics
+-----------------------------------
+
+The `v5 Full/Top-k results <results/full_topk_8k100_v5/README.md>`_ include
+curves, original scalar metric logs, CSV tables, provenance and a local plotting
+script. Full completed 100 steps; Top-k has 91 recorded steps and validation
+through step 90. Both latest validation accuracies are below their baselines;
+this snapshot is not a completed 100-step comparison.
+
 Configuration
 -------------
 
