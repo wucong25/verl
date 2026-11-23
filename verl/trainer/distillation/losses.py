@@ -59,12 +59,13 @@ class DistillationLossSettings(BaseConfig):
     names: str | list[str] = field(default_factory=list)
     use_topk: bool = False
     use_estimator: bool = False
+    use_full_vocab: bool = False
 
     _mutable_fields = {"names"}
 
     def __post_init__(self):
         self.names = [self.names] if isinstance(self.names, str) else self.names
-        if sum([self.use_topk, self.use_estimator]) != 1:
+        if sum([self.use_topk, self.use_estimator, self.use_full_vocab]) != 1:
             raise ValueError(
                 f"Expected only one of use_estimator, use_topk, but got {self.use_estimator=}, {self.use_topk=}."
             )
@@ -149,7 +150,7 @@ def compute_topk_loss(
     loss_mode = distillation_config.distillation_loss.loss_mode
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
-        case "fsdp" | "veomni" | "fsdp2":
+        case "fsdp" | "veomni" | "fsdp2" | "fsdp_turbo":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
             loss_functions = {
@@ -248,6 +249,22 @@ def distillation_ppo_loss(
     - student_logits is not None, return the topk loss tensor (bsz, seqlen/cp_size).
     - student_logits is None, return the final policy loss scalar and metrics.
     """
+
+    if student_logits is not None and distillation_config.distillation_loss.loss_settings.use_full_vocab:
+        from verl.trainer.distillation.full_vocab_loss import compute_full_vocab_loss
+
+        return compute_full_vocab_loss(
+            config,
+            distillation_config,
+            data,
+            student_logits,
+            data_format,
+            quant_align_size=quant_align_size,
+            min_local_rows=min_local_rows,
+            pad_to_length_bucket=pad_to_length_bucket,
+            cp_layout=cp_layout,
+            local_cp_size=local_cp_size,
+        )
 
     # Called as logits processor
     if student_logits is not None or student_topk_log_probs is not None:
@@ -500,3 +517,10 @@ def compute_distillation_loss_reverse_kl_estimator(
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
     return distillation_losses, metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names="forward_kl_full", use_full_vocab=True))
+def compute_forward_kl_full(config, distillation_config, model_output, data):
+    """Aggregate exact full-vocabulary KL without truncated-KL clamping."""
+    losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    return losses, {}

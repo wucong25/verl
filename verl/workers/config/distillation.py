@@ -67,6 +67,7 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode: str = "k3"
     topk: Optional[int] = 128
+    full_vocab_chunk_size: int = 128
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
@@ -127,6 +128,14 @@ class DistillationLossConfig(BaseConfig):
                 " wrt model weights does not depend on teacher log probabilities."
             )
 
+        if self.loss_settings.use_full_vocab:
+            if self.use_policy_gradient:
+                raise ValueError("forward_kl_full requires use_policy_gradient=False.")
+            if self.log_prob_min_clamp is not None or self.loss_max_clamp is not None:
+                raise ValueError("Exact full-vocabulary KL requires both clamps to be None.")
+            if self.full_vocab_chunk_size <= 0:
+                raise ValueError("full_vocab_chunk_size must be positive.")
+
         if self.loss_mode == "forward_kl_topk_tail":
             if self.log_prob_min_clamp is not None:
                 raise ValueError(
@@ -161,6 +170,8 @@ class DistillationTeacherModelConfig(BaseConfig):
     model_path: Optional[str] = None
     inference: RolloutConfig = field(default_factory=RolloutConfig)
     num_replicas: Optional[int] = 0
+    training_engine: dict = field(default_factory=dict)
+    training_model: dict = field(default_factory=dict)
 
     @property
     def per_replica_world_size(self) -> int:
@@ -183,6 +194,10 @@ class DistillationTeacherModelConfig(BaseConfig):
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
     def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+        if self.inference.name == "training_engine":
+            if not self.training_engine:
+                raise ValueError("training_engine configuration is required.")
+            return
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
@@ -286,6 +301,11 @@ class DistillationConfig(BaseConfig):
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
+            if (
+                self.distillation_loss.loss_settings.use_full_vocab
+                and teacher_model.inference.name != "training_engine"
+            ):
+                raise ValueError("forward_kl_full requires a training_engine teacher.")
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,

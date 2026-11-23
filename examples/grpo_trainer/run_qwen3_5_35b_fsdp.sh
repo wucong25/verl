@@ -3,6 +3,12 @@
 # dependency: NPU vllm==0.18.0, vllm-ascend@<54879467>, transformers@<cc7ab9be>
 
 set -xeuo pipefail
+MODEL_PATH=/home/w00848261/Qwen3.5-27B
+HOME=/home/w00848261
+TRAIN_FILE=/home/w00848261/geo3k/train.parquet
+TEST_FILE=/home/w00848261/geo3k/test.parquet
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
 
 ########################### user-adjustable ###########################
 # DEVICE is auto-detected by probing torch_npu; override only for special cases.
@@ -115,21 +121,23 @@ ROLLOUT=(
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.max_num_batched_tokens=8192
     actor_rollout_ref.rollout.free_cache_engine=True
-    actor_rollout_ref.rollout.enforce_eager=False
+    actor_rollout_ref.rollout.enforce_eager=True
     actor_rollout_ref.rollout.enable_prefix_caching=False
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=6144
+    actor_rollout_ref.rollout.checkpoint_engine.backend=delta_sharded
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.delta_sharded.encoding=indices
 )
 
 TRAINER=(
     trainer.critic_warmup=0
-    trainer.logger=['console','wandb']
+    trainer.logger=['console']
     trainer.project_name="${PROJECT_NAME}"
     trainer.experiment_name="${EXPERIMENT_NAME}"
     trainer.n_gpus_per_node=${n_devices_per_node}
     trainer.nnodes=${NNODES}
     trainer.balance_batch=False
     trainer.resume_from_path=checkpoints/
-    trainer.val_before_train=True
+    trainer.val_before_train=False
     trainer.save_freq=5
     trainer.test_freq=5
     trainer.total_epochs=15

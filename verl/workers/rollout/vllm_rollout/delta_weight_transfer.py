@@ -136,7 +136,7 @@ def decode_delta_payload(
     named_tensors: Iterable[tuple[str, torch.Tensor]],
 ) -> tuple[str, list[CheckpointWeightPatch]]:
     """Validate and decode one DeltaFlush into vLLM checkpoint patches."""
-
+    print(f"wucong kkkkkkkkkkkkkkk is_cuda_available ")
     from verl.checkpoint_engine.delta_sync.encode import checksum
 
     CheckpointWeightPatch, _ = _checkpoint_patch_api()
@@ -215,6 +215,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
 
     def _validate_configuration(self) -> None:
         require_vllm_delta_support()
+        print(f"wucong sssssssssss is_cuda_available {is_cuda_available}")
         if not is_cuda_available or self.device.type != get_device_name():
             raise NotImplementedError("VERL delta weight transfer requires CUDA")
         if self.parallel_config.data_parallel_size != 1:

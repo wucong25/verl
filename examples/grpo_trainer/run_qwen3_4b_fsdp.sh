@@ -5,6 +5,11 @@
 
 set -xeuo pipefail
 
+MODEL_PATH=/home/w00848261/Qwen3-8B
+TRAIN_FILE=/home/w00848261/train.parquet
+TEST_FILE=/home/w00848261/test.parquet
+
+
 # ---- user-adjustable ----
 # DEVICE is auto-detected by probing torch_npu; override only for special cases.
 DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo gpu)}
@@ -16,7 +21,7 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-512}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
@@ -43,11 +48,11 @@ case "${DEVICE}" in
         ;;
     npu)
         export VLLM_USE_V1=1
-        export TASK_QUEUE_ENABLE=2
+        export TASK_QUEUE_ENABLE=1
         export CPU_AFFINITY_CONF=1
         export LD_PRELOAD="/usr/lib/aarch64-linux-gnu/libjemalloc.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
         NGPUS_PER_NODE=16
-        ROLLOUT_GPU_MEM_UTIL=0.9
+        ROLLOUT_GPU_MEM_UTIL=0.75
         ;;
     *)
         echo "Unsupported DEVICE=${DEVICE}. Expected 'gpu' or 'npu'." >&2
@@ -100,6 +105,8 @@ ROLLOUT=(
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
+    actor_rollout_ref.rollout.checkpoint_engine.backend=delta_sharded
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.delta_sharded.encoding=indices
 )
 
 REF=(
@@ -111,7 +118,7 @@ REF=(
 
 TRAINER=(
     trainer.critic_warmup=0
-    trainer.logger='["console","wandb"]'
+    trainer.logger='["console"]'
     trainer.project_name=${PROJECT_NAME}
     trainer.experiment_name=${EXPERIMENT_NAME}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}

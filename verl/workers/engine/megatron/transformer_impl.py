@@ -133,6 +133,8 @@ def _check_dcp_unsupported_features(engine_config, model_config, tf_config=None,
             batch, key="distillation_only", default=False
         ):
             raise NotImplementedError("Dynamic CP does not support distillation")
+        if tu.get_non_tensor_data(batch, key="return_full_logits", default=False):
+            raise NotImplementedError("Dynamic CP does not support full-vocabulary teacher outputs")
         if tu.get_non_tensor_data(batch, key="score_centering", default=False):
             raise NotImplementedError("Dynamic CP does not support score centering")
 
@@ -449,7 +451,7 @@ class MegatronEngine(BaseEngine):
         else:
             wrap_with_ddp = True
 
-        layer_wise_muon = is_muon_layer_wise_config(self.optimizer_config)
+        layer_wise_muon = self.optimizer_config is not None and is_muon_layer_wise_config(self.optimizer_config)
         wrap_config = McoreModuleWrapperConfig(
             is_value_model=self.is_value_model,
             wrap_with_ddp=wrap_with_ddp,
@@ -825,6 +827,11 @@ class MegatronEngine(BaseEngine):
         return torch.tensor(input_ids.numel(), device=input_ids.device)
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+        from verl.workers.engine.full_vocab import validate_full_vocab_inference
+
+        validate_full_vocab_inference(
+            data, forward_only=forward_only, use_fused_kernels=self.engine_config.use_fused_kernels
+        )
         self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
 
@@ -1196,10 +1203,16 @@ class MegatronEngineWithLMHead(MegatronEngine):
         cp_layout: str = "zigzag",
         local_cp_size: int | None = None,
     ):
+        if tu.get_non_tensor_data(batch, key="return_full_logits", default=False):
+            from verl.workers.engine.full_vocab import megatron_full_vocab_output
+
+            return megatron_full_vocab_output(logits, self.model_config.hf_config)
         assert logits.shape[:2] == label.shape[:2]
         # avoid non-positive temperature such as padding
         temperature[temperature <= 0] = 1e-8
         assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
+        full_vocab = tu.get_non_tensor_data(batch, key="distillation_use_full_vocab", default=False)
+        full_vocab_logits = logits.clone() if full_vocab else None
         logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
         ret = {}
         # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
@@ -1227,13 +1240,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
             logits_bak = logits
 
         # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
-        if distillation_use_topk or score_centering:
+        if distillation_use_topk or score_centering or full_vocab:
             from verl.models.mcore.util import get_thd_quant_align_size
 
             # the top-k tensors are packed like the student inputs: the same padding, CP layout and CP group
             ret.update(
                 logits_processor_func(
-                    student_logits=logits_bak,
+                    student_logits=full_vocab_logits if full_vocab else logits_bak,
                     data=batch,
                     data_format=data_format,
                     quant_align_size=get_thd_quant_align_size(self.tf_config),
@@ -1245,7 +1258,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if not distillation_only:
             # the cross entropy shifts fp32 logits in place; the score centering hook re-reads them in backward
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(
-                logits_bak.clone() if score_centering else logits_bak, label
+                logits_bak.clone() if (score_centering or full_vocab) else logits_bak, label
             )
 
         return ret
@@ -1266,6 +1279,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
             )
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
+        if tu.get_non_tensor_data(batch, key="distillation_use_full_vocab", default=False) and use_fused_kernels:
+            raise ValueError("Full-vocabulary KL requires use_fused_kernels=False.")
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
         score_centering = tu.get_non_tensor_data(batch, key="score_centering", default=False)

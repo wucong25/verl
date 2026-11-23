@@ -186,6 +186,7 @@ class vLLMColocateWorkerExtension:
         vllm_config = kwargs.get("vllm_config")
         weight_transfer_config = getattr(vllm_config, "weight_transfer_config", None)
         if getattr(weight_transfer_config, "backend", None) == "verl_delta_ipc":
+            print("wucong llllllllllllllll")
             from verl.workers.rollout.vllm_rollout.delta_weight_transfer import (
                 register_verl_delta_weight_transfer_engine,
             )

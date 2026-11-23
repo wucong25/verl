@@ -475,6 +475,22 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         return final_output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    def infer_full_logits(self, data: TensorDict) -> TensorDict:
+        """Return teacher logits through the training engine at temperature one.
+
+        Row t predicts input token t+1; callers align response masks and verify
+        tokenizer compatibility. Dense payloads require small micro-batches.
+        """
+        if self.engine_config.use_fused_kernels:
+            raise ValueError("Full-vocabulary teacher inference requires use_fused_kernels=False.")
+        if self.engine_config.strategy not in {"fsdp", "fsdp2", "fsdp_turbo", "megatron"}:
+            raise ValueError(f"Unsupported full-vocabulary teacher backend: {self.engine_config.strategy}")
+        tu.assign_non_tensor(
+            data, return_full_logits=True, compute_loss=False, return_model_output=True, temperature=1.0
+        )
+        return self.infer_batch(data)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
@@ -814,12 +830,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
-
+        print(f"wucong ssssssss effective_mode{effective_mode}")
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
             if effective_mode == "delta_sharded":
                 # the delta engine owns the sync state machine (seed vs steady,
                 # snapshot prime), so it drives the training engine itself.
+                print(f"wucong ssssssss checkpoint_engine{self.checkpoint_engine}")
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
             else:
                 per_tensor_param, _ = self.actor.engine.get_per_tensor_param()

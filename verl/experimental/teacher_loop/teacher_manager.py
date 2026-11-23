@@ -120,12 +120,16 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         mm_processor_output: Optional[list[dict[str, Any]]] = None,
         routing_key: Optional[str] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        multi_modal_inputs: Optional[dict] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
         client = self.teacher_client[teacher_key]
+        if teacher_model_config.inference.name == "training_engine":
+            return await client.compute(sequence_ids, position_ids, multi_modal_inputs)
         teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,

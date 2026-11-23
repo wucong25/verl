@@ -21,6 +21,7 @@ from .base import (
     TensorMeta,
 )
 
+
 __all__ = [
     "CheckpointEngine",
     "CheckpointEngineRegistry",
@@ -82,3 +83,13 @@ try:
 except ImportError as e:
     CheckpointEngineRegistry.record_import_error("delta_checkpoint_engine", e)
     DeltaShardedCheckpointEngine = None
+
+# Ascend-only HCCL transport subclass; registers the same "delta_sharded" backend
+# name on NPU, where the CUDA engine above skips its own registration.
+try:
+    from .delta_checkpoint_engine import HCCLDeltaShardedCheckpointEngine
+
+    __all__ += ["HCCLDeltaShardedCheckpointEngine"]
+except ImportError as e:
+    CheckpointEngineRegistry.record_import_error("delta_checkpoint_engine_npu", e)
+    HCCLDeltaShardedCheckpointEngine = None

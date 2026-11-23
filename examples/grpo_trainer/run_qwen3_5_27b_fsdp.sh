@@ -4,6 +4,11 @@
 
 set -xeuo pipefail
 
+MODEL_PATH=/home/w00848261/Qwen3.5-27B
+HOME=/home/w00848261
+TRAIN_FILE=/home/w00848261/geo3k/train.parquet
+TEST_FILE=/home/w00848261/geo3k/test.parquet
+
 ########################### user-adjustable ###########################
 # DEVICE is auto-detected by probing torch_npu; override only for special cases.
 DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo gpu)}
@@ -118,11 +123,13 @@ ROLLOUT=(
     actor_rollout_ref.rollout.enforce_eager=False
     actor_rollout_ref.rollout.enable_prefix_caching=False
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=6144
+    actor_rollout_ref.rollout.checkpoint_engine.backend=delta_sharded
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.delta_sharded.encoding=indices
 )
 
 TRAINER=(
     trainer.critic_warmup=0
-    trainer.logger=['console','wandb']
+    trainer.logger=['console']
     trainer.project_name="${PROJECT_NAME}"
     trainer.experiment_name="${EXPERIMENT_NAME}"
     trainer.n_gpus_per_node=${n_devices_per_node}

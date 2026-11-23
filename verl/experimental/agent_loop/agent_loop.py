@@ -913,6 +913,8 @@ class AgentLoopWorker:
             response_ids=output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
+            teacher_position_ids=position_ids[0, ..., attention_mask[0].bool()].contiguous(),
+            teacher_multi_modal_inputs=multi_modal_inputs,
         )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
@@ -1122,6 +1124,8 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        teacher_position_ids: Optional[torch.Tensor] = None,
+        teacher_multi_modal_inputs: Optional[dict] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
@@ -1131,12 +1135,27 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            teacher_key = self.teacher_server_manager._resolve_teacher_key(routing_key)
+            teacher_config = self.teacher_server_manager.teacher_model_configs[teacher_key]
+            if teacher_config.inference.name == "training_engine" and teacher_position_ids is None:
+                # TransferQueue postprocessing calls this before its own model-input
+                # assembly. Build unpadded vision inputs and M-RoPE positions here.
+                teacher_input_ids = torch.tensor([prompt_ids + response_ids], dtype=torch.long)
+                teacher_multi_modal_inputs = self._compute_multi_modal_inputs(output, teacher_input_ids)
+                teacher_position_ids = self._compute_position_ids(
+                    teacher_input_ids,
+                    torch.ones_like(teacher_input_ids),
+                    teacher_multi_modal_inputs,
+                    output.mm_processor_kwargs,
+                )[0].contiguous()
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 mm_processor_output=getattr(output, "mm_processor_output", None),
                 routing_key=routing_key,
+                position_ids=teacher_position_ids,
+                multi_modal_inputs=teacher_multi_modal_inputs,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs

@@ -403,3 +403,22 @@ if __name__ == "__main__":
     test_response_from_nested()
     test_response_to_nested()
     print("All padding conversion tests passed!")
+
+
+@pytest.mark.parametrize("lengths", [(7,), (8, 8), (5, 9)])
+@pytest.mark.parametrize("axes", [3, 4])
+def test_transferqueue_position_ids_restore_token_offsets(lengths, axes):
+    samples = [torch.arange(axes * length).reshape(axes, length) for length in lengths]
+    # TQ reconstructs arbitrary tensor lists with the default ragged axis,
+    # falling back to strided nested tensors when both axes differ.
+    layout = torch.jagged if len(set(lengths)) == 1 else torch.strided
+    received = torch.nested.as_nested_tensor(samples, layout=layout)
+    inputs = torch.nested.as_nested_tensor([torch.arange(length) for length in lengths], layout=torch.jagged)
+    data = TensorDict({"position_ids": received, "input_ids": inputs}, batch_size=[len(lengths)])
+    tu.maybe_fix_3d_position_ids(data)
+    tu.maybe_fix_3d_position_ids(data)  # TrainingWorker also normalizes this field.
+    assert data["position_ids"].shape[1] == axes
+    assert data["position_ids"].offsets().diff().tolist() == list(lengths)
+    selected = tu.index_select_tensor_dict(data, [len(lengths) - 1, 0])
+    for actual, index in zip(selected["position_ids"].unbind(), [len(lengths) - 1, 0], strict=True):
+        torch.testing.assert_close(actual, samples[index])

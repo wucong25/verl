@@ -168,6 +168,7 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
 
     tq_client = tq.get_client()
     tensordict = await tq_client.async_get_data(meta)
+    tu.maybe_fix_3d_position_ids(tensordict)
 
     for key, val in meta_info.items():
         if isinstance(val, (NonTensorData | NonTensorStack)):

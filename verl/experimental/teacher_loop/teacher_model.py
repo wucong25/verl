@@ -195,6 +195,7 @@ class MultiTeacherModelManager:
 
         self.resource_pool = resource_pool
         self.teacher_model_managers: dict[str, TeacherModelManager] = {}
+        self.training_teacher_clients = {}
         self.server_addresses: dict[str, list[str]] = {}
         self.server_handles: dict[str, list] = {}
         self.load_balancer_handle: dict[str, object] = {}
@@ -207,6 +208,32 @@ class MultiTeacherModelManager:
         split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
 
         for (key, teacher_model_config), teacher_pool in zip(teacher_models.items(), split_pools, strict=True):
+            if teacher_model_config.inference.name == "training_engine":
+                import ray
+                from transformers import AutoTokenizer
+
+                from .training_teacher import TrainingTeacherClient, TrainingTeacherReplica
+
+                student_tokenizer = AutoTokenizer.from_pretrained(self.config.actor_rollout_ref.model.path)
+                teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_config.model_path)
+                if student_tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
+                    raise ValueError("Training-engine distillation requires identical teacher/student token IDs.")
+                loss_settings = self.distillation_config.distillation_loss.loss_settings
+                if not (loss_settings.use_topk or loss_settings.use_full_vocab):
+                    raise ValueError("Training-engine teachers currently require full-vocabulary or top-k KL.")
+                pools = split_resource_pool(teacher_pool, split_size=teacher_model_config.per_replica_world_size)
+                replicas = [
+                    TrainingTeacherReplica.remote(teacher_model_config, pool, self.config.trainer.device)
+                    for pool in pools
+                ]
+                ray.get([replica.ready.remote() for replica in replicas])
+                loss_config = self.distillation_config.distillation_loss
+                self.training_teacher_clients[key] = TrainingTeacherClient(
+                    replicas,
+                    loss_config.loss_settings.use_full_vocab,
+                    loss_config.topk,
+                )
+                continue
             manager = TeacherModelManager(
                 distillation_config=self.distillation_config,
                 teacher_model_config=teacher_model_config,
@@ -219,7 +246,7 @@ class MultiTeacherModelManager:
 
     def get_client(self) -> dict[str, LLMServerClient]:
         """Get the LLMServerClient for each teacher model."""
-        teacher_clients = {}
+        teacher_clients = dict(self.training_teacher_clients)
         for key, manager in self.teacher_model_managers.items():
             teacher_clients[key] = LLMServerClient(
                 config=self.config,
